@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from models.models import EHFBClassifier
 from models.layer import get_embedding
 from transformers import BertModel, AdamW
-from data_utils import build_senticNet, Tokenizer4BertGCN, ABSAGCNData, ABSA_collate_fn
+from data_utils1 import build_senticNet, Tokenizer4BertGCN, ABSAGCNData, ABSA_collate_fn
 from prepare_vocab import VocabHelp
 from tensorboardX import SummaryWriter
 
@@ -189,8 +189,8 @@ def main():
     
     dataset_files = {
         'restaurant': {
-            'train': './dataset/Restaurants_corenlp/train_new.json',
-            'test': './dataset/Restaurants_corenlp/test_new.json',
+            'train': './dataset/Restaurants_corenlp_AMRBART/train.json',
+            'test': './dataset/Restaurants_corenlp_AMRBART/test.json',
         },
         'laptop': {
             'train': './dataset/Laptops_corenlp/train_new.json',
@@ -272,7 +272,8 @@ def main():
     parser.add_argument('--fusion_condition', default='ResEMFH', type=str, help='[ConvIteract, Triaffine, ResEMFH]')
     parser.add_argument('--dep_layers', type=int, default=0)
     parser.add_argument('--sem_layers', type=int, default=0)
-
+    parser.add_argument('--amr_layers', type=int, default=0)
+    
     # Interact(EMFN)
     parser.add_argument('--high_order', type=bool, default=True)
     parser.add_argument('--hidden_size', type=int, default=512, help='lower dimension, 512, 400')
@@ -285,6 +286,8 @@ def main():
     # opt.inputs_cols = input_colses[opt.model_name]
     opt.initializer = initializers[opt.initializer]
     opt.optimizer = optimizers[opt.optimizer]
+    opt.amr_edge_stoi = './stoi.pt'
+    opt.amr_edge_pt = './embedding.pt'
 
     print("choice cuda:{}".format(opt.cuda))
     os.environ["CUDA_VISIBLE_DEVICES"] = opt.cuda

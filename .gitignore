@@ -1,0 +1,7 @@
+__pycache__/*
+curvs/*
+models/__pycache__/*
+embeddings/*
+log/*
+embedding.pt
+stoi.pt

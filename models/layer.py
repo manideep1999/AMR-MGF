@@ -17,17 +17,20 @@ from pytorch_metric_learning.regularizers import LpRegularizer
 
 # con, dep and seman update module
 class GCNEncoder(nn.Module):
-    def __init__(self, emb_dim, con_layers, dep_layers, sem_layers, gcn_dropout=0.1):
+    def __init__(self, emb_dim, con_layers, dep_layers, sem_layers, amr_layers = 9, gcn_dropout=0.1):
         super().__init__()
         self.con_layers = con_layers
         self.dep_layers = dep_layers
         self.sem_layers = sem_layers
+        self.amr_layers = amr_layers
+
         self.emb_dim = emb_dim
         self.out_dim = emb_dim
         # gcn layer
         self.W_con = nn.ModuleList()
         self.W_dep = nn.ModuleList()
         self.W_sem = nn.ModuleList()
+        self.W_amr = nn.ModuleList()
         for layer in range(self.con_layers):
             input_dim = self.emb_dim if layer == 0 else self.out_dim
             self.W_con.append(nn.Linear(input_dim, input_dim))
@@ -37,15 +40,19 @@ class GCNEncoder(nn.Module):
         for layer in range(self.sem_layers):
             input_dim = self.emb_dim if layer == 0 else self.out_dim
             self.W_sem.append(nn.Linear(input_dim, input_dim))
-        self.gcn_drop = nn.Dropout(gcn_dropout)
+        for layer in range(self.amr_layers):
+            input_dim = self.emb_dim if layer == 0 else self.out_dim
+            self.W_amr.append(nn.Linear(input_dim, input_dim))
+        self.gcn_drop = nn.Dropout(gcn_dropout)        
 
-    def forward(self, inputs, con_adj, dep_adj, seman_adj, tok_length):
+    def forward(self, inputs, con_adj, dep_adj, seman_adj, amr_adj, tok_length):
         # gcn layer
-        con_input, dep_input, seman_input = inputs, inputs, inputs
-
+        con_input, dep_input, seman_input, amr_input = inputs, inputs, inputs, inputs
+        
         # denom_con_dep_seman
         dep_denom = dep_adj.sum(2).unsqueeze(2) + 1
         seman_denom = seman_adj.sum(2).unsqueeze(2) + 1
+        amr_denom = amr_adj.sum(2).unsqueeze(2) + 1
 
         for index in range(self.con_layers):
             con_adj_new = con_adj[index].bool().float()
@@ -77,14 +84,24 @@ class GCNEncoder(nn.Module):
             seman_gAxW = F.relu(seman_AxW)
             seman_input = self.gcn_drop(seman_gAxW) if index < self.sem_layers - 1 else seman_gAxW
 
-        multi_loss = process_adj_matrices(dep_adj, con_adj[0].bool().float(), seman_adj, con_input, dep_input, tok_length)
-        
-        return con_input, dep_input, seman_input, multi_loss
+        for index in range(self.amr_layers):
+            amr_Ax = amr_adj.bmm(amr_input)
+            amr_AxW = self.W_amr[index](amr_Ax)
+            amr_AxW = amr_AxW + self.W_amr[index](amr_input)  # self-loop
+            amr_AxW = amr_AxW / amr_denom
+            amr_gAxW = F.relu(amr_AxW)
+            amr_input = self.gcn_drop(amr_gAxW) if index < self.amr_layers - 1 else amr_gAxW
+
+        # print(amr_input)
+        multi_loss = process_adj_matrices(dep_adj, con_adj[0].bool().float(), seman_adj, amr_adj, con_input, dep_input, amr_input, tok_length)
+        # print(multi_loss)
+        return con_input, dep_input, seman_input, amr_input, multi_loss
     
-def process_adj_matrices(dep_adj, con_adj_new, seman_adj, con_input, dep_input, tok_len):
+def process_adj_matrices(dep_adj, con_adj_new, seman_adj, amr_adj, con_input, dep_input, amr_input, tok_len):
     batch_size, max_length, _ = dep_adj.size()
     
     multi_viewdep_loss = 0
+    multi_viewamr_loss = 0  # NEW: accumulate AMR-related loss
 
     for b in range(batch_size):
         length = int(tok_len[b])
@@ -93,6 +110,7 @@ def process_adj_matrices(dep_adj, con_adj_new, seman_adj, con_input, dep_input, 
         dep_adj_batch = dep_adj[b, :length, :length].to(dtype=torch.int)
         con_adj_new_batch = con_adj_new[b, :length, :length].to(dtype=torch.int)
         sem_adj_batch = seman_adj[b, :length, :length]
+        amr_adj_batch = amr_adj[b, :length, :length].to(dtype=torch.int)  # AMR ADJ
 
         # caculate importance scores
         node_importance_scores = sem_adj_batch.mean(dim=1) + sem_adj_batch.max(dim=1).values
@@ -137,7 +155,27 @@ def process_adj_matrices(dep_adj, con_adj_new, seman_adj, con_input, dep_input, 
 
             multi_Dep_loss += AD_loss
 
-        multi_viewdep_loss += multi_Dep_loss
+            # ----------------------
+            # AMR CONTRASTIVE LOSS
+            # ----------------------
+            Anchor_AMR = amr_input[b, i]
+            amr_view_node_index = (amr_adj_batch[i] > 0).nonzero(as_tuple=True)[0]
+            # Remove self-loop if you don't want the anchor as its own positive
+            amr_view_node_index = amr_view_node_index[amr_view_node_index != i]
+            AMR_view_node = amr_input[b, amr_view_node_index] if amr_view_node_index.numel() > 0 else Anchor_AMR.unsqueeze(0)
+
+            # Negative: all nodes NOT in amr_view_node_index
+            all_indices = torch.arange(length, device=amr_input.device)
+            neg_indices = all_indices[~torch.isin(all_indices, amr_view_node_index)]
+            AMR_view_node_neg = amr_input[b, neg_indices] if neg_indices.numel() > 0 else Anchor_AMR.unsqueeze(0)
+
+            # Compute contrastive loss for AMR
+            AMR_loss = multi_margin_contrastive_loss(Anchor_AMR, AMR_view_node, AMR_view_node_neg)
+            multi_viewamr_loss += AMR_loss
+            print(f"Batch {b}, Node {i}: AMR Loss: {AMR_loss.item()}, Dep Loss: {AD_loss.item()}")
+            # breakpoint()
+
+        multi_viewdep_loss += multi_Dep_loss + multi_viewamr_loss
 
     return multi_viewdep_loss
 
@@ -638,24 +676,18 @@ class ResEMFH(nn.Module):
         else:
             self.mfb = MFB(opt, True, d_bert)
 
-    def forward(self, con_feat, dep_feat, sem_feat, know_feat):
-
+    def forward(self, con_feat, dep_feat, sem_feat, amr_feat, know_feat):
         if self.opt.high_order:
-            z1, exp1, f_pcon_1, f_pdep_1 = self.mfh1(con_feat, dep_feat, sem_feat, know_feat)
-            residual1 = z1
-            z2, exp2, f_pcon_2, f_pdep_2 = self.mfh2(f_pcon_1, f_pdep_1, sem_feat, know_feat, exp1)
-            residual2 = z2
-            z3, exp3, f_pcon_3, f_pdep_3 = self.mfh3(f_pcon_2, f_pdep_2, sem_feat, know_feat, exp2)
-            residual3 = z3
-            z4, exp4, f_pcon_4, f_pdep_4 = self.mfh4(f_pcon_3, f_pdep_3, sem_feat, know_feat, exp3)
-            residual4 = z4
-            z5, exp5, f_pcon_5, f_pdep_5 = self.mfh5(f_pcon_4, f_pdep_4, sem_feat, know_feat, exp4)
-            residual5 = z5
-            z6, exp6, f_pcon_6, f_pdep_6 = self.mfh6(f_pcon_5, f_pdep_5, sem_feat, know_feat, exp5)
-            z6 = z6 + residual3
+            z1, exp1, f_pcon_1, f_pdep_1 = self.mfh1(con_feat, dep_feat, sem_feat, amr_feat, know_feat)
+            z2, exp2, f_pcon_2, f_pdep_2 = self.mfh2(f_pcon_1, f_pdep_1, sem_feat, amr_feat, know_feat, exp1)
+            z3, exp3, f_pcon_3, f_pdep_3 = self.mfh3(f_pcon_2, f_pdep_2, sem_feat, amr_feat, know_feat, exp2)
+            z4, exp4, f_pcon_4, f_pdep_4 = self.mfh4(f_pcon_3, f_pdep_3, sem_feat, amr_feat, know_feat, exp3)
+            z5, exp5, f_pcon_5, f_pdep_5 = self.mfh5(f_pcon_4, f_pdep_4, sem_feat, amr_feat, know_feat, exp4)
+            z6, exp6, f_pcon_6, f_pdep_6 = self.mfh6(f_pcon_5, f_pdep_5, sem_feat, amr_feat, know_feat, exp5)
+            z6 = z6 + z3  # residual
             z = torch.mean(torch.cat((z1, z2, z3, z4, z5, z6), 1), dim=1, keepdim=False)
         else:
-            z, _ = self.mfb(con_feat, dep_feat, sem_feat, know_feat)
+            z, _ = self.mfb(con_feat, dep_feat, sem_feat, amr_feat, know_feat)
             z = z.squeeze(1)
 
         return z
@@ -667,44 +699,55 @@ class MFB(nn.Module):
         self.is_first = is_first
         self.bert_dim = d_bert
 
-        # Proj layer
         self.proj_i = nn.Linear(d_bert, d_bert)
         self.proj_q = nn.Linear(d_bert, d_bert)
         self.proj_ent = nn.Linear(d_bert, d_bert)
-        self.proj_struct = nn.Linear(2*opt.lstm_dim+opt.dim_k, d_bert)
+        self.proj_amr = nn.Linear(d_bert, d_bert)
+        self.proj_struct = nn.Linear(2 * opt.lstm_dim + opt.dim_k, d_bert)
 
-        # dropout layer
         self.dropout = nn.Dropout(opt.dropout_r)
 
-    def forward(self, con_feat, dep_feat, sem_feat, know_feat, exp_in=1):
-        # Expand Stage
+    def forward(self, con_feat, dep_feat, sem_feat, amr_feat, know_feat, exp_in=1):
         batch_size = con_feat.shape[0]
+
         con_feat = self.proj_i(con_feat)
         dep_feat = self.proj_q(dep_feat)
         sem_feat = self.proj_ent(sem_feat)
+        amr_feat = self.proj_amr(amr_feat)
         know_feat = self.proj_struct(know_feat)
 
-        exp_out = con_feat * dep_feat * sem_feat * know_feat
+        # Cross-projection: AMR orthogonal to semantic
+        f_p_amr = amr_feat
+        f_c_sem = sem_feat
+        f_p_amr_ = proj(f_p_amr, f_c_sem)
+        f_pamr_tilde = proj(f_p_amr, (f_p_amr - f_p_amr_))
+
+        # Expanded stage (fused features)
+        exp_out = con_feat * dep_feat * sem_feat * f_pamr_tilde * know_feat
         exp_out = self.dropout(exp_out) if self.is_first else self.dropout(exp_out * exp_in)
 
-        # Suqeeze Stage
+        # Squeeze stage
         z = torch.sqrt(F.relu(exp_out)) - torch.sqrt(F.relu(-exp_out))
         z = F.normalize(z.view(batch_size, -1))
         z = z.view(batch_size, -1, self.bert_dim)
 
-        # orthogonal projection
+        # Orthogonal projections for con and dep
         f_p_con = con_feat
-        f_c_seman = sem_feat
-        f_p_con_ = proj(f_p_con, f_c_seman)
+        f_p_con_ = proj(f_p_con, sem_feat)
         f_pcon_tilde = proj(f_p_con, (f_p_con - f_p_con_))
 
         f_p_dep = dep_feat
-        f_c_seman = sem_feat
-        f_p_dep_ = proj(f_p_dep, f_c_seman)
+        f_p_dep_ = proj(f_p_dep, sem_feat)
         f_pdep_tilde = proj(f_p_dep, (f_p_dep - f_p_dep_))
-        
+
         return z, exp_out, f_pcon_tilde, f_pdep_tilde
-    
+
+# def proj(x, y):
+#     # Project x onto y (x · y / y · y) * y
+#     y_norm_sq = (y * y).sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps
+#     proj_coeff = (x * y).sum(dim=-1, keepdim=True) / y_norm_sq
+#     return proj_coeff * y
+  
 def proj(x, y):
     numerator = x * y
     denominator = torch.abs(y) + torch.finfo(torch.float32).eps  
