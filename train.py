@@ -24,6 +24,8 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 writer = SummaryWriter('curvs')
+import wandb
+wandb.login()
 
 def setup_seed(seed):
     np.random.seed(seed)
@@ -48,10 +50,10 @@ class Instructor:
         
         tokenizer = Tokenizer4BertGCN(opt.max_length, opt.pretrained_bert_name)
         bert = BertModel.from_pretrained(opt.pretrained_bert_name)
-        dep_vocab = VocabHelp.load_vocab(opt.vocab_dir + '/vocab_dep.vocab')
+        # dep_vocab = VocabHelp.load_vocab(opt.vocab_dir + '/vocab_dep.vocab')
         self.model = opt.model_class(bert, graph_embeddings, opt).to(opt.device)
-        trainset = ABSAGCNData(opt.dataset_file['train'], tokenizer, opt, dep_vocab)
-        testset = ABSAGCNData(opt.dataset_file['test'], tokenizer, opt, dep_vocab)
+        trainset = ABSAGCNData(opt.dataset_file['train'], tokenizer, opt)
+        testset = ABSAGCNData(opt.dataset_file['test'], tokenizer, opt)
             
         self.train_dataloader = DataLoader(dataset=trainset, batch_size=opt.batch_size, shuffle=True, drop_last=True, collate_fn=ABSA_collate_fn)
         self.test_dataloader = DataLoader(dataset=testset, batch_size=opt.batch_size, drop_last=True, collate_fn=ABSA_collate_fn)
@@ -108,7 +110,7 @@ class Instructor:
                 targets = batch[-1]
 
                 outputs, multi_loss = self.model(inputs)          
-                Lc = criterion(outputs.view(-1, 3), targets.view(-1))
+                Lc = self.criterion(outputs.view(-1, 3), targets.view(-1))
                 Ldep = multi_loss
                 loss = self.opt.gamma * Lc + self.opt.theta * Ldep
 
@@ -119,7 +121,7 @@ class Instructor:
                     n_correct += (torch.argmax(outputs, -1) == targets).sum().item()
                     n_total += len(outputs)
                     train_acc = n_correct / n_total
-                    test_acc, f1 = self._evaluate()
+                    test_acc, f1, val_loss = self._evaluate()
                     if test_acc > max_test_acc:
                         max_test_acc = test_acc
                         if test_acc > max_test_acc_overall:
@@ -131,7 +133,18 @@ class Instructor:
                     if f1 > max_f1:
                         max_f1 = f1
                     logger.info('loss: {:.4f}, acc: {:.4f}, test_acc: {:.4f}, f1: {:.4f}'.format(loss.item(), train_acc, test_acc, f1))
-            
+                    wandb.define_metric("test_acc", summary="max")
+                    wandb.define_metric("f1", summary="max")
+                    wandb.log({
+                        "train_acc": train_acc, 
+                        "train_loss": loss.item(), 
+                        "test_loss": val_loss, 
+                        "test_acc": test_acc, 
+                        "f1": f1,
+                        "learning_rate": self.opt.bert_lr,
+                        "epoch": epoch,
+                        "global_step": global_step
+                    })
         return max_test_acc, max_f1, model_path
     
     def _evaluate(self, show_results=False):
@@ -142,18 +155,23 @@ class Instructor:
         targets_all, outputs_all = None, None
         device = self.opt.device
 
+        total_val_loss = 0  # Initialize total_val_loss
+        dataset = self.test_dataloader        
         with torch.no_grad():
             for batch, sample_batched in enumerate(self.test_dataloader):
                 batch = [b.to(device) for b in sample_batched]
                 inputs = batch[:-1]     # 这是涉及到一个切片的操作，所以直接去掉最后一个变量
                 targets = batch[-1]
                 outputs, _ = self.model(inputs)
+                val_loss = self.criterion(outputs, targets)
+                total_val_loss += val_loss.item()  # Accumulate total loss
                 n_test_correct += (torch.argmax(outputs, -1) == targets).sum().item()
                 n_test_total += len(outputs)
                 targets_all = torch.cat((targets_all, targets), dim=0) if targets_all is not None else targets
                 outputs_all = torch.cat((outputs_all, outputs), dim=0) if outputs_all is not None else outputs
         test_acc = n_test_correct / n_test_total
         f1 = metrics.f1_score(targets_all.cpu(), torch.argmax(outputs_all, -1).cpu(), labels=[0, 1, 2], average='macro')
+        val_loss = total_val_loss / len(dataset)  # Compute average validation/test loss
 
         labels = targets_all.data.cpu()
         predic = torch.argmax(outputs_all, -1).cpu()
@@ -162,15 +180,15 @@ class Instructor:
             confusion = metrics.confusion_matrix(labels, predic)
             return report, confusion, test_acc, f1
 
-        return test_acc, f1
+        return test_acc, f1, val_loss
         
     
     def run(self):
-        criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss()
         optimizer = self.get_bert_optimizer(self.model)
         max_test_acc_overall = 0
         max_f1_overall = 0
-        max_test_acc, max_f1, model_path = self._train(criterion, optimizer, max_test_acc_overall)
+        max_test_acc, max_f1, model_path = self._train(self.criterion, optimizer, max_test_acc_overall)
         logger.info('max_test_acc: {0}, max_f1: {1}'.format(max_test_acc, max_f1))
         max_test_acc_overall = max(max_test_acc, max_test_acc_overall)
         max_f1_overall = max(max_f1, max_f1_overall)
@@ -188,23 +206,31 @@ def main():
     }
     
     dataset_files = {
-        'restaurant': {
-            'train': './dataset/Restaurants_corenlp_AMRBART/train.json',
-            'test': './dataset/Restaurants_corenlp_AMRBART/test.json',
+        'restaurant_spring': {
+            'train': './dataset/Restaurants_spring/train.json',
+            'test': './dataset/Restaurants_spring/test.json',
         },
-        'laptop': {
-            'train': './dataset/Laptops_corenlp/train_new.json',
-            'test': './dataset/Laptops_corenlp/test_new.json'
+        'laptop_spring': {
+            'train': './dataset/Laptops_spring/train.json',
+            'test': './dataset/Laptops_spring/test.json'
         },
-        'twitter': {
-            'train': './dataset/Tweets_corenlp/train_new.json',
-            'test': './dataset/Tweets_corenlp/test_new.json',
-        }
+        'twitter_spring': {
+            'train': './dataset/Tweets_spring/train.json',
+            'test': './dataset/Tweets_spring/test.json',
+        },
+        'restaurant_amrbart': {
+            'train': './dataset/Restaurants_amrbart/train.json',
+            'test': './dataset/Restaurants_amrbart/test.json',
+        },
+        'laptop_amrbart': {
+            'train': './dataset/Laptops_amrbart/train.json',
+            'test': './dataset/Laptops_amrbart/test.json',
+        },
+        'twitter_amrbart': {
+            'train': './dataset/Tweets_amrbart/train.json',
+            'test': './dataset/Tweets_amrbart/test.json',
+        },
     }
-    
-    # input_colses = {
-    #     'latgatsembert': ['text_bert_indices', 'bert_segments_ids', 'attention_mask', 'src_mask', 'aspect_mask', 'lex', 'ori_tag', 'head', 'con_spans'],
-    # }
     
     initializers = {
         'xavier_uniform_': torch.nn.init.xavier_uniform_,
@@ -299,6 +325,28 @@ def main():
     log_file = '{}-{}-{}.log'.format(opt.model_name, opt.dataset, strftime("%Y-%m-%d_%H_%M_%S", localtime()))
     logger.addHandler(logging.FileHandler("%s/%s" % ('./log', log_file)))
 
+    wandb.init(
+        project="AMR-MGF",
+        config={
+            "model_name": opt.model_name,
+            "dataset": opt.dataset,
+            "bert_lr": opt.bert_lr,
+            "bert_dropout": opt.bert_dropout,
+            "num_epoch": opt.num_epoch,
+            "hidden_dim": opt.hidden_dim,
+            "max_length": opt.max_length,
+            "cuda": opt.cuda,
+            "seed": opt.seed,
+            "vocab_dir": opt.vocab_dir,
+            "batch_size": opt.batch_size,
+            "fusion_condition": opt.fusion_condition,
+            "sem_layers": opt.sem_layers,
+            "dep_layers": opt.dep_layers,
+            "amr_layers": opt.amr_layers,
+            "gamma": opt.gamma,
+            "theta": opt.theta,
+        }
+    )
     ins = Instructor(opt)
     ins.run()
     writer.close()

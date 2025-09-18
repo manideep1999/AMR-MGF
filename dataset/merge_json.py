@@ -3,10 +3,10 @@ import os
 
 # file and dataset paths
 
-file_name = 'train_new.json' # the EMGF dataset file containing the dep and con spans
-amrbart_file_name = 'train_with_amrbart.json' # the AMRBART dataset file containing the amr edges and tokens
-dataset_name = 'Restaurants_corenlp_AMRBART' # the name of the dataset folder containing the files
-output_file_name = 'train.json' # the name of the output file to be created
+file_name = 'train.json' # the EMGF dataset file containing the dep and con spans
+amrbart_file_name = 'train_with_amr.json' # the AMRBART dataset file containing the amr edges and tokens
+dataset_name = 'Laptops_spring' # the name of the dataset folder containing the files
+output_file_name = 'train_spring.json' # the name of the output file to be created
 
 # Define file paths
 current_dir = os.path.dirname(os.path.abspath(__file__)) 

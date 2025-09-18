@@ -158,24 +158,25 @@ def process_adj_matrices(dep_adj, con_adj_new, seman_adj, amr_adj, con_input, de
             # ----------------------
             # AMR CONTRASTIVE LOSS
             # ----------------------
-            Anchor_AMR = amr_input[b, i]
-            amr_view_node_index = (amr_adj_batch[i] > 0).nonzero(as_tuple=True)[0]
-            # Remove self-loop if you don't want the anchor as its own positive
-            amr_view_node_index = amr_view_node_index[amr_view_node_index != i]
-            AMR_view_node = amr_input[b, amr_view_node_index] if amr_view_node_index.numel() > 0 else Anchor_AMR.unsqueeze(0)
+            # Anchor_AMR = amr_input[b, i]
+            # amr_view_node_index = (amr_adj_batch[i] > 0).nonzero(as_tuple=True)[0]
+            # # Remove self-loop if you don't want the anchor as its own positive
+            # amr_view_node_index = amr_view_node_index[amr_view_node_index != i]
+            # AMR_view_node = amr_input[b, amr_view_node_index] if amr_view_node_index.numel() > 0 else Anchor_AMR.unsqueeze(0)
 
-            # Negative: all nodes NOT in amr_view_node_index
-            all_indices = torch.arange(length, device=amr_input.device)
-            neg_indices = all_indices[~torch.isin(all_indices, amr_view_node_index)]
-            AMR_view_node_neg = amr_input[b, neg_indices] if neg_indices.numel() > 0 else Anchor_AMR.unsqueeze(0)
+            # # Negative: all nodes NOT in amr_view_node_index
+            # all_indices = torch.arange(length, device=amr_input.device)
+            # neg_indices = all_indices[~torch.isin(all_indices, amr_view_node_index)]
+            # AMR_view_node_neg = amr_input[b, neg_indices] if neg_indices.numel() > 0 else Anchor_AMR.unsqueeze(0)
 
-            # Compute contrastive loss for AMR
-            AMR_loss = multi_margin_contrastive_loss(Anchor_AMR, AMR_view_node, AMR_view_node_neg)
-            multi_viewamr_loss += AMR_loss
-            print(f"Batch {b}, Node {i}: AMR Loss: {AMR_loss.item()}, Dep Loss: {AD_loss.item()}")
+            # # Compute contrastive loss for AMR
+            # AMR_loss = multi_margin_contrastive_loss(Anchor_AMR, AMR_view_node, AMR_view_node_neg)
+            # multi_viewamr_loss += AMR_loss
+            # print(f"Batch {b}, Node {i}: AMR Loss: {AMR_loss.item()}, Dep Loss: {AD_loss.item()}")
             # breakpoint()
 
-        multi_viewdep_loss += multi_Dep_loss + multi_viewamr_loss
+        # multi_viewdep_loss += multi_Dep_loss + multi_viewamr_loss
+        multi_viewdep_loss += multi_Dep_loss
 
     return multi_viewdep_loss
 
@@ -360,21 +361,21 @@ def get_span_matrix_3D(span_list, rm_loop=False, max_len=None):
 def get_embedding(vocab, opt):
     graph_emb=0
 
-    if opt.dataset == 'laptop':
+    if 'laptop' in opt.dataset:
         graph_file = 'embeddings/entity_embeddings_analogy_400.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_analogy.pkl' % opt.dataset
         else:
             graph_pkl = 'embeddings/%s_graph_analogy_bert.pkl' % opt.dataset
         # graph_pkl = 'embeddings/%s_graph_analogy_roberta.pkl' % ds_name
-    elif opt.dataset == 'restaurant':
+    elif 'restaurant' in opt.dataset:
         graph_file = 'embeddings/entity_embeddings_distmult_200.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_dismult.pkl' % opt.dataset
         else:
             graph_pkl = 'embeddings/%s_graph_dismult_bert.pkl' % opt.dataset
         # graph_pkl = 'embeddings/%s_graph_dismult_roberta.pkl' % ds_name
-    elif opt.dataset == 'twitter':
+    elif 'twitter' in opt.dataset:
         graph_file = 'embeddings/entity_embeddings_distmult_200.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_dismult.pkl' % opt.dataset
@@ -789,3 +790,166 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.linear(self.fc(x))
+    
+class HFfusion(nn.Module):
+    def __init__(self, opt, d_bert):
+        super(HFfusion, self).__init__()
+        self.opt = opt
+        self.d_bert = d_bert
+        self.hidden_dim = d_bert
+        
+        # Knowledge graph dimension projection (handle different input dimensions)
+        # Based on the error, knowledge features seem to have different dimensions
+        self.knowledge_proj = nn.Linear(2 * opt.lstm_dim + opt.dim_k, d_bert)
+        
+        # Local-level fusion components
+        self.local_attention = nn.MultiheadAttention(d_bert, num_heads=8, dropout=0.1, batch_first=True)
+        self.local_norm = nn.LayerNorm(d_bert)
+        
+        # Intermediate-level fusion components
+        self.inter_cross_attn = nn.MultiheadAttention(d_bert, num_heads=8, dropout=0.1, batch_first=True)
+        self.inter_norm = nn.LayerNorm(d_bert)
+        
+        # Global-level fusion components  
+        self.global_cross_attn = nn.MultiheadAttention(d_bert, num_heads=4, dropout=0.1, batch_first=True)
+        self.global_norm = nn.LayerNorm(d_bert)
+        
+        # Gating mechanisms for adaptive fusion
+        self.syntactic_gate = nn.Sequential(
+            nn.Linear(d_bert * 2, d_bert),
+            nn.Sigmoid()
+        )
+        
+        self.semantic_gate = nn.Sequential(
+            nn.Linear(d_bert * 2, d_bert), 
+            nn.Sigmoid()
+        )
+        
+        self.knowledge_gate = nn.Sequential(
+            nn.Linear(d_bert * 2, d_bert),
+            nn.Sigmoid()
+        )
+        
+        # Progressive fusion layers
+        self.fusion_layer1 = nn.Sequential(
+            nn.Linear(d_bert * 3, d_bert),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.LayerNorm(d_bert)
+        )
+        
+        self.fusion_layer2 = nn.Sequential(
+            nn.Linear(d_bert * 2, d_bert),
+            nn.ReLU(), 
+            nn.Dropout(0.1),
+            nn.LayerNorm(d_bert)
+        )
+        
+        self.final_fusion = nn.Sequential(
+            nn.Linear(d_bert * 2, d_bert),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.LayerNorm(d_bert)
+        )
+        
+        # Feature enhancement modules
+        self.feature_enhancer = nn.Sequential(
+            nn.Linear(d_bert, d_bert),
+            nn.GELU(),
+            nn.Linear(d_bert, d_bert),
+            nn.Dropout(0.1)
+        )
+        
+        # Hierarchical attention weights
+        self.level_weights = nn.Parameter(torch.ones(3))  # Local, Intermediate, Global
+        
+        # Cross-modal interaction
+        self.cross_modal_proj = nn.Linear(d_bert, d_bert // 2)
+        self.modal_interaction = nn.MultiheadAttention(d_bert // 2, num_heads=4, batch_first=True)
+        
+    def forward(self, bert_enc, graph_con, graph_dep, graph_seman, graph_amr, graph_know):
+        batch_size = bert_enc.size(0)
+        
+        # Project knowledge features to match BERT dimension
+        if len(graph_know.shape) == 2 and graph_know.size(-1) != self.d_bert:
+            graph_know = self.knowledge_proj(graph_know)
+        
+        # Reshape inputs for attention (add sequence dimension if needed)
+        if len(bert_enc.shape) == 2:
+            bert_enc = bert_enc.unsqueeze(1)  # [B, 1, D]
+            graph_con = graph_con.unsqueeze(1)
+            graph_dep = graph_dep.unsqueeze(1) 
+            graph_seman = graph_seman.unsqueeze(1)
+            graph_amr = graph_amr.unsqueeze(1)
+            
+        # Handle knowledge dimension properly
+        if len(graph_know.shape) == 2:
+            graph_know = graph_know.unsqueeze(1)
+        
+        # === Level 1: Local Syntactic Fusion ===
+        # Fuse constituency and dependency representations
+        syn_concat = torch.cat([graph_con, graph_dep], dim=-1)
+        syn_gate = self.syntactic_gate(syn_concat)
+        syn_fused = syn_gate * graph_con + (1 - syn_gate) * graph_dep
+        
+        # Local attention for syntactic features
+        syn_attended, _ = self.local_attention(syn_fused, syn_fused, syn_fused)
+        syn_local = self.local_norm(syn_fused + syn_attended)
+        
+        # === Level 2: Intermediate Semantic Integration ===
+        # Integrate semantic and AMR representations
+        sem_concat = torch.cat([graph_seman, graph_amr], dim=-1)
+        sem_gate = self.semantic_gate(sem_concat)
+        sem_fused = sem_gate * graph_seman + (1 - sem_gate) * graph_amr
+        
+        # Cross-attention between syntactic and semantic
+        sem_cross_attn, _ = self.inter_cross_attn(sem_fused, syn_local, syn_local)
+        sem_inter = self.inter_norm(sem_fused + sem_cross_attn)
+        
+        # Progressive fusion at intermediate level
+        inter_features = torch.cat([syn_local, sem_inter, bert_enc], dim=-1)
+        inter_fused = self.fusion_layer1(inter_features)
+        
+        # === Level 3: Global Knowledge Integration ===
+        # Integrate knowledge graph information
+        know_concat = torch.cat([inter_fused, graph_know], dim=-1)
+        know_gate = self.knowledge_gate(know_concat)
+        know_enhanced = know_gate * inter_fused + (1 - know_gate) * graph_know
+        
+        # Global cross-attention
+        global_attn, _ = self.global_cross_attn(know_enhanced, inter_fused, inter_fused)
+        global_features = self.global_norm(know_enhanced + global_attn)
+        
+        # === Cross-Modal Interaction ===
+        # Project to lower dimension for efficient interaction
+        bert_proj = self.cross_modal_proj(bert_enc)
+        global_proj = self.cross_modal_proj(global_features)
+        
+        # Cross-modal attention
+        cross_modal, _ = self.modal_interaction(bert_proj, global_proj, global_proj)
+        cross_modal = torch.cat([cross_modal, global_proj], dim=-1)  # Restore dimension
+        
+        # === Final Hierarchical Fusion ===
+        # Combine BERT and graph features
+        bert_graph_concat = torch.cat([bert_enc, global_features], dim=-1)
+        bert_graph_fused = self.fusion_layer2(bert_graph_concat)
+        
+        # Final fusion with cross-modal interaction
+        final_concat = torch.cat([bert_graph_fused, cross_modal], dim=-1)
+        final_output = self.final_fusion(final_concat)
+        
+        # Feature enhancement
+        enhanced_output = self.feature_enhancer(final_output)
+        final_output = final_output + enhanced_output  # Residual connection
+        
+        # Apply hierarchical level weights (learnable importance)
+        level_weights = F.softmax(self.level_weights, dim=0)
+        weighted_output = (level_weights[0] * syn_local + 
+                          level_weights[1] * inter_fused + 
+                          level_weights[2] * final_output)
+        
+        # Remove sequence dimension if added
+        if weighted_output.size(1) == 1:
+            weighted_output = weighted_output.squeeze(1)
+            
+        return weighted_output

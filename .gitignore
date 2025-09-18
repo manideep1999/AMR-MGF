@@ -5,3 +5,5 @@ embeddings/*
 log/*
 embedding.pt
 stoi.pt
+state_dict/*
+wandb/*

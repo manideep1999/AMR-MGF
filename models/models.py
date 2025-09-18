@@ -57,6 +57,10 @@ class GCNAbsaModel(nn.Module):
 
         # Interact Module(EMFH)
         self.ResEMFH = ResEMFH(opt, opt.bert_dim)
+        
+        # Hierarchical Fusion Module
+        self.HFfusion = HFfusion(opt, opt.bert_dim)
+        
         self.classifier = nn.Linear(opt.bert_dim, opt.polarities_dim)
 
     def forward(self, inputs):
@@ -85,6 +89,9 @@ class GCNAbsaModel(nn.Module):
         
         elif self.opt.fusion_condition == 'ResEMFH':
             final_output = self.ResEMFH(graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_amr_outputs, graph_know_outputs)
+
+        elif self.opt.fusion_condition == 'HF':
+            final_output = self.HFfusion(bert_enc_outputs, graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_amr_outputs, graph_know_outputs)
 
         logits = self.classifier(final_output)
 

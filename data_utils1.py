@@ -25,12 +25,12 @@ class Tokenizer4BertGCN:
 
 
 class ABSAGCNData(Dataset):
-    def __init__(self, fname, tokenizer, opt, dep_vocab):
+    def __init__(self, fname, tokenizer, opt):
         # load raw data
         with open(fname, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
 
-        self.data = self.process(raw_data, tokenizer, opt, dep_vocab)
+        self.data = self.process(raw_data, tokenizer, opt)
 
     def __len__(self):
         return len(self.data)
@@ -38,7 +38,7 @@ class ABSAGCNData(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
     
-    def process(self, raw_data, tokenizer, opt, dep_vocab):
+    def process(self, raw_data, tokenizer, opt):
 
         polarity_dict = {'positive':0, 'negative':1, 'neutral':2}
         max_len = opt.max_length 
