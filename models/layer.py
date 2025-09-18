@@ -206,90 +206,6 @@ def get_2nd_order_pairs(edge_list1, edge_list2):
 
     return list1, list2
 
-# condep and seman update module
-class ConDep_GCNEncoder(nn.Module):
-    def __init__(self, emb_dim=768, num_layers=3,gcn_dropout=0.1):
-        super().__init__()
-        self.layers = num_layers
-        self.emb_dim = emb_dim
-        self.out_dim = emb_dim
-        # gcn layer
-        self.W = nn.ModuleList()
-        for layer in range(self.layers):
-            input_dim = self.emb_dim if layer == 0 else self.out_dim
-            self.W.append(nn.Linear(input_dim, input_dim))
-        self.gcn_drop = nn.Dropout(gcn_dropout)
-
-    def forward(self, inputs, con_adj, dep_adj, seman_adj):
-        # gcn layer
-        condep_input, seman_input = inputs, inputs
-
-        # seman denom
-        seman_denom = seman_adj.sum(2).unsqueeze(2) + 1
-
-        for index in range(self.layers):
-            con_adj_new = con_adj[index].bool().float()
-            condep_adj = con_adj_new * dep_adj
-            condep_denom = condep_adj.sum(2).unsqueeze(2) + 1
-
-            # condep
-            condep_Ax = condep_adj.bmm(condep_input)
-            condep_AxW = self.W[index](condep_Ax)
-            condep_AxW = condep_AxW + self.W[index](condep_input)  # self loop
-            condep_AxW = condep_AxW / condep_denom
-            condep_gAxW = F.relu(condep_AxW)
-            condep_input = self.gcn_drop(condep_gAxW) if index < self.layers - 1 else condep_gAxW
-
-            # seman
-            seman_Ax = seman_adj.bmm(seman_input)
-            seman_AxW = self.W[index](seman_Ax)
-            seman_AxW = seman_AxW + self.W[index](seman_input)  # self loop
-            seman_AxW = seman_AxW / seman_denom
-            seman_gAxW = F.relu(seman_AxW)
-            seman_input = self.gcn_drop(seman_gAxW) if index < self.layers - 1 else seman_gAxW
-
-        # feature projection loss
-        f_p_condep = condep_input
-        f_c_seman = seman_input
-        f_p_condep_ = proj(f_p_condep, f_c_seman)
-        f_pcondep_tilde = proj(f_p_condep, (f_p_condep - f_p_condep_))
-
-        return f_pcondep_tilde, seman_input
-
-# traditional gcn module
-class GCN(nn.Module):
-
-    def __init__(self, emb_dim=768, num_layers=2,gcn_dropout=0.1):
-        super(GCN, self).__init__()
-        self.layers = num_layers
-        self.emb_dim = emb_dim
-        self.out_dim = emb_dim
-        # gcn layer
-        self.W = nn.ModuleList()
-        for layer in range(self.layers):
-            input_dim = self.emb_dim if layer == 0 else self.out_dim
-            self.W.append(nn.Linear(input_dim, input_dim))
-        self.gcn_drop = nn.Dropout(gcn_dropout)
-
-
-    def forward(self, inputs, adj):
-        # gcn layer
-        
-        denom = adj.sum(2).unsqueeze(2) + 1
-        # mask = (adj.sum(2) + adj.sum(1)).eq(0).unsqueeze(2)
-
-        for l in range(self.layers):
-            Ax = adj.bmm(inputs)
-            AxW = self.W[l](Ax)
-            AxW = AxW + self.W[l](inputs)  # self loop
-            AxW = AxW / denom
-            gAxW = F.relu(AxW)
-            inputs = self.gcn_drop(gAxW) if l < self.layers - 1 else gAxW
-
-        return inputs
-    
-
-
 # multi-head attention layer
 class MultiHeadAttention(nn.Module):
 
@@ -361,21 +277,21 @@ def get_span_matrix_3D(span_list, rm_loop=False, max_len=None):
 def get_embedding(vocab, opt):
     graph_emb=0
 
-    if opt.dataset == 'laptop':
+    if 'laptop' in opt.dataset:
         graph_file = 'embeddings/entity_embeddings_analogy_400.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_analogy.pkl' % opt.dataset
         else:
             graph_pkl = 'embeddings/%s_graph_analogy_bert.pkl' % opt.dataset
         # graph_pkl = 'embeddings/%s_graph_analogy_roberta.pkl' % ds_name
-    elif opt.dataset == 'restaurant':
+    elif 'restaurant' in opt.dataset:
         graph_file = 'embeddings/entity_embeddings_distmult_200.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_dismult.pkl' % opt.dataset
         else:
             graph_pkl = 'embeddings/%s_graph_dismult_bert.pkl' % opt.dataset
         # graph_pkl = 'embeddings/%s_graph_dismult_roberta.pkl' % ds_name
-    elif opt.dataset == 'twitter':
+    elif 'twitter' in opt.dataset:
         graph_file = 'embeddings/entity_embeddings_distmult_200.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_dismult.pkl' % opt.dataset
@@ -401,24 +317,6 @@ def get_embedding(vocab, opt):
     return graph_embeddings
 
 
-
-def mask_logits(target, mask):
-    return target * mask + (1 - mask) * (-1e30)
-
-def ids2ori_adj(ori_tag, sent_len, head):
-    adj = []
-    # print(sent_len)
-    for b in range(ori_tag.size()[0]):
-        ret = np.ones((sent_len, sent_len), dtype='float32')
-        fro_list = head[b]
-        for i in range(len(fro_list) - 1):
-            to = i + 1
-            fro = fro_list[i]
-            ret[fro][to] = ori_tag[b][i]
-            ret[to][fro] =ori_tag[b][i]
-        adj.append(ret)
-
-    return adj
 
 def sequence_mask(lengths, max_len=None):
     """
@@ -514,282 +412,7 @@ class DynamicLSTM(nn.Module):
                     x_unsort_idx]  # (num_layers * num_directions, batch, hidden_size) -> (batch, ...)
                 ct = torch.transpose(ct, 0, 1)
 
-            return out, (ht, ct)
-        
-class ConvInteract(nn.Module):
-    def __init__(self, hidden_dim):
-        super(ConvInteract, self).__init__()
-
-        self.hidden_dim = hidden_dim
-
-        # Define residual connections and LayerNorm layers
-        self.residual_layer1 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
-                                             nn.ReLU(),
-                                             nn.Linear(hidden_dim, hidden_dim),
-                                             nn.LayerNorm(hidden_dim))
-        self.residual_layer2 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
-                                             nn.ReLU(),
-                                             nn.Linear(hidden_dim, hidden_dim),
-                                             nn.LayerNorm(hidden_dim))
-        self.residual_layer3 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
-                                             nn.ReLU(),
-                                             nn.Linear(hidden_dim, hidden_dim),
-                                             nn.LayerNorm(hidden_dim))
-        
-        # self.linear = nn.Linear(self.hidden_dim, self.hidden_dim)
-
-        self.GatedGCN = GatedGCN(hidden_dim, hidden_dim)
-
-        # Fusion layer
-        self.lstm = nn.LSTM(self.hidden_dim*2, self.hidden_dim, 2, batch_first=True,
-                            bidirectional=True)
-
-        # MLP
-        self.feature_fusion = nn.Sequential(nn.Linear(hidden_dim*2, hidden_dim),
-                                             nn.ReLU(),
-                                             nn.Linear(hidden_dim, hidden_dim),
-                                             nn.LayerNorm(hidden_dim))
-
-    def forward(self, h_feature, h_con, h_dep, h_seman):
-
-        h_con_inter, h_dep_inter, h_seman_inter = self.GatedGCN(h_con, h_dep, h_seman)
-
-        # residual enhanced layer
-        h_con_new = self.residual_layer1(h_feature + h_con_inter)
-        h_dep_new = self.residual_layer2(h_feature + h_dep_inter)
-        h_seman_new = self.residual_layer3(h_feature + h_seman_inter)
-
-        # concat = torch.cat([h_syn_feature, h_sem_feature], dim=2)
-        # output, _ = self.lstm(concat)
-        # h_fusion = self.feature_fusion(output)
-
-        return h_con_new, h_dep_new, h_seman_new
-    
-class FeatureStacking(nn.Module):
-    def __init__(self, hidden_dim):
-        super(FeatureStacking, self).__init__()
-        self.hidden_dim = hidden_dim
-
-    def forward(self, input1, input2):
-        # stack the three input features along the third dimension to form a new tensor with dimensions [a, b, c, hidden_dim]
-        # stacked_input = torch.stack([input1, input2, input3, input4], dim=3)
-        stacked_input = torch.stack([input1, input2], dim=3)
-
-        # apply average pooling along the fourth dimension to obtain a tensor with dimensions [a, b, c, 1]
-        # pooled_input = torch.mean(stacked_input, dim=3, keepdim=True)
-        pooled_input,_ = torch.max(stacked_input, dim=3, keepdim=True)
-
-        # reshape the tensor to the desired output shape [a, b, c]
-        output = pooled_input.squeeze(3)
-
-        return output
-
-class GatedGCN(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, gated_layers=2):
-        super(GatedGCN, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.gated_layers = gated_layers
-        self.conv1 = GCNConv(self.input_dim, self.hidden_dim)                                                           # GCNConv默认添加add_self_loops
-        # self.conv2 = GCNConv(self.input_dim, self.hidden_dim)
-        self.conv3 = GatedGraphConv(self.hidden_dim, self.gated_layers)
-
-    def forward(self, h_con, h_dep, h_seman):
-        # Build graph data structures
-        B, S, D = h_con.shape
-        h_con_ = h_con.view(-1)
-        h_dep_ = h_dep.view(-1)
-        h_seman_ = h_seman.view(-1)
-        features = torch.stack([h_con_, h_dep_, h_seman_], dim=-1)
-        data = Data(x=features)
-        data.cuda()
-        data.x = data.x.view(-1, self.input_dim)
-        data.edge_index, _ = dense_to_sparse(torch.ones(S, S).cuda())
-        data.edge_attr = compute_cosine_similarity(data.x, data.edge_index)
-        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-
-        x = F.relu(self.conv1(x, edge_index, edge_attr))
-        # x = F.relu(self.conv2(x, edge_index, edge_attr))
-        x = F.relu(self.conv3(x, edge_index))
-
-        h_fusion_con, h_fusion_dep, h_fusion_seman = x.view(3, B, S, D)[0], x.view(3, B, S, D)[1], x.view(3, B, S, D)[2]
-
-        return h_fusion_con, h_fusion_dep, h_fusion_seman
-    
-# Calculate the edge weights, i.e. Euclidean distance
-def edge_weight(x, edge_index):
-    row, col = edge_index
-    edge_attr = (x[row] - x[col]).norm(p=2, dim=-1).view(edge_index.size(1), -1)
-
-    return edge_attr
-
-# Cosine similarity
-def compute_cosine_similarity(x, edge_index):
-
-    edge_index_row, edge_index_col = edge_index[0], edge_index[1]
-
-    x_row = x[edge_index_row]
-    x_col = x[edge_index_col]
-    similarity = F.cosine_similarity(x_row, x_col, dim=1)
-    min_value = similarity.min()
-    max_value = similarity.max()
-    similarity = (similarity - min_value) / (max_value - min_value)
-
-    return similarity
-
-# Pearson correlation coefficient
-def compute_pearson_correlation(x, edge_index):
-    mean_x = torch.mean(x, dim=1)
-
-    # Compute differences between each value and the mean for x
-    diff_x = x - mean_x[:, None]
-
-    # Compute the sum of squared differences for x
-    sum_squared_diff_x = torch.sum(diff_x ** 2, dim=1)
-
-    # Compute the square root of the sum of squared differences for x
-    sqrt_sum_squared_diff_x = torch.sqrt(sum_squared_diff_x)
-
-    # Compute the product of the square roots for x
-    product_sqrt_diff_x = sqrt_sum_squared_diff_x[edge_index[0]] * sqrt_sum_squared_diff_x[edge_index[1]]
-
-    # Compute the sum of the multiplied differences
-    sum_multiplied_diff = torch.sum(diff_x[edge_index[0]] * diff_x[edge_index[1]], dim=1)
-
-    # Compute the Pearson correlation coefficient
-    pearson_corr = sum_multiplied_diff / product_sqrt_diff_x
-
-    return pearson_corr
-
-# Interact Module(EMFH)
-class ResEMFH(nn.Module):
-    def __init__(self, opt, d_bert):
-        super(ResEMFH, self).__init__()
-        self.opt = opt
-
-        if self.opt.high_order:
-            self.mfh1 = MFB(opt, False, d_bert)
-            self.mfh2 = MFB(opt, False, d_bert)
-            self.mfh3 = MFB(opt, False, d_bert)
-            self.mfh4 = MFB(opt, False, d_bert)
-            self.mfh5 = MFB(opt, False, d_bert)
-            self.mfh6 = MFB(opt, False, d_bert)
-        else:
-            self.mfb = MFB(opt, True, d_bert)
-
-    def forward(self, con_feat, dep_feat, sem_feat, amr_feat, know_feat):
-        if self.opt.high_order:
-            z1, exp1, f_pcon_1, f_pdep_1 = self.mfh1(con_feat, dep_feat, sem_feat, amr_feat, know_feat)
-            z2, exp2, f_pcon_2, f_pdep_2 = self.mfh2(f_pcon_1, f_pdep_1, sem_feat, amr_feat, know_feat, exp1)
-            z3, exp3, f_pcon_3, f_pdep_3 = self.mfh3(f_pcon_2, f_pdep_2, sem_feat, amr_feat, know_feat, exp2)
-            z4, exp4, f_pcon_4, f_pdep_4 = self.mfh4(f_pcon_3, f_pdep_3, sem_feat, amr_feat, know_feat, exp3)
-            z5, exp5, f_pcon_5, f_pdep_5 = self.mfh5(f_pcon_4, f_pdep_4, sem_feat, amr_feat, know_feat, exp4)
-            z6, exp6, f_pcon_6, f_pdep_6 = self.mfh6(f_pcon_5, f_pdep_5, sem_feat, amr_feat, know_feat, exp5)
-            z6 = z6 + z3  # residual
-            z = torch.mean(torch.cat((z1, z2, z3, z4, z5, z6), 1), dim=1, keepdim=False)
-        else:
-            z, _ = self.mfb(con_feat, dep_feat, sem_feat, amr_feat, know_feat)
-            z = z.squeeze(1)
-
-        return z
-    
-class MFB(nn.Module):
-    def __init__(self, opt, is_first, d_bert):
-        super(MFB, self).__init__()
-        self.opt = opt
-        self.is_first = is_first
-        self.bert_dim = d_bert
-
-        self.proj_i = nn.Linear(d_bert, d_bert)
-        self.proj_q = nn.Linear(d_bert, d_bert)
-        self.proj_ent = nn.Linear(d_bert, d_bert)
-        self.proj_amr = nn.Linear(d_bert, d_bert)
-        self.proj_struct = nn.Linear(2 * opt.lstm_dim + opt.dim_k, d_bert)
-
-        self.dropout = nn.Dropout(opt.dropout_r)
-
-    def forward(self, con_feat, dep_feat, sem_feat, amr_feat, know_feat, exp_in=1):
-        batch_size = con_feat.shape[0]
-
-        con_feat = self.proj_i(con_feat)
-        dep_feat = self.proj_q(dep_feat)
-        sem_feat = self.proj_ent(sem_feat)
-        amr_feat = self.proj_amr(amr_feat)
-        know_feat = self.proj_struct(know_feat)
-
-        # Cross-projection: AMR orthogonal to semantic
-        f_p_amr = amr_feat
-        f_c_sem = sem_feat
-        f_p_amr_ = proj(f_p_amr, f_c_sem)
-        f_pamr_tilde = proj(f_p_amr, (f_p_amr - f_p_amr_))
-
-        # Expanded stage (fused features)
-        exp_out = con_feat * dep_feat * sem_feat * f_pamr_tilde * know_feat
-        exp_out = self.dropout(exp_out) if self.is_first else self.dropout(exp_out * exp_in)
-
-        # Squeeze stage
-        z = torch.sqrt(F.relu(exp_out)) - torch.sqrt(F.relu(-exp_out))
-        z = F.normalize(z.view(batch_size, -1))
-        z = z.view(batch_size, -1, self.bert_dim)
-
-        # Orthogonal projections for con and dep
-        f_p_con = con_feat
-        f_p_con_ = proj(f_p_con, sem_feat)
-        f_pcon_tilde = proj(f_p_con, (f_p_con - f_p_con_))
-
-        f_p_dep = dep_feat
-        f_p_dep_ = proj(f_p_dep, sem_feat)
-        f_pdep_tilde = proj(f_p_dep, (f_p_dep - f_p_dep_))
-
-        return z, exp_out, f_pcon_tilde, f_pdep_tilde
-
-# def proj(x, y):
-#     # Project x onto y (x · y / y · y) * y
-#     y_norm_sq = (y * y).sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps
-#     proj_coeff = (x * y).sum(dim=-1, keepdim=True) / y_norm_sq
-#     return proj_coeff * y
-  
-def proj(x, y):
-    numerator = x * y
-    denominator = torch.abs(y) + torch.finfo(torch.float32).eps  
-    projection = numerator / denominator * (y / denominator)
-    
-    return projection
-
-class FC(nn.Module):
-    def __init__(self, in_size, out_size, dropout_r=0., use_relu=True):
-        super(FC, self).__init__()
-        self.dropout_r = dropout_r
-        self.use_relu = use_relu
-
-        self.linear = nn.Linear(in_size, out_size)
-
-        if use_relu:
-            self.relu = nn.ReLU(inplace=True)
-
-        if dropout_r > 0:
-            self.dropout = nn.Dropout(dropout_r)
-
-    def forward(self, x):
-        x = self.linear(x)
-
-        if self.use_relu:
-            x = self.relu(x)
-
-        if self.dropout_r > 0:
-            x = self.dropout(x)
-
-        return x
-
-class MLP(nn.Module):
-    def __init__(self, in_size, mid_size, out_size, dropout_r=0., use_relu=True):
-        super(MLP, self).__init__()
-
-        self.fc = FC(in_size, mid_size, dropout_r=dropout_r, use_relu=use_relu)
-        self.linear = nn.Linear(mid_size, out_size)
-
-    def forward(self, x):
-        return self.linear(self.fc(x))
+            return out, (ht, ct)        
     
 class HFfusion(nn.Module):
     def __init__(self, opt, d_bert):

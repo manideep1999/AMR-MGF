@@ -7,9 +7,7 @@ import torch
 import copy
 import torch.nn as nn
 import torch.nn.functional as F
-from .attention import StructuredAttention as StructuredAtt 
 from .layer import *
-from .affine import Biaffine, Triaffine
 
 
 class LayerNorm(nn.Module):
@@ -27,7 +25,7 @@ class LayerNorm(nn.Module):
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 
-class EHFBClassifier(nn.Module):
+class AMRMGFClassifier(nn.Module):
     def __init__(self, bert, embeddings, opt):
         super().__init__()
         self.opt = opt
@@ -40,7 +38,6 @@ class EHFBClassifier(nn.Module):
 
     def forward(self, inputs):
         tok_length, bert_length, bert_sequence, bert_segments_ids, word_mapback, map_AS, aspect_token, aspect_mask, src_mask, dep_spans, con_spans, amr_spans = inputs
-        # print("tok_length, bert_length, bert_sequence.shape, bert_segments_ids.shape, word_mapback.shape, map_AS.shape, aspect_token.shape, aspect_mask.shape, src_mask.shape, dep_spans.shape, con_spans.shape" , len(tok_length), len(bert_length), bert_sequence.shape, bert_segments_ids.shape, word_mapback.shape, map_AS.shape, aspect_token.shape, aspect_mask.shape, src_mask.shape, dep_spans.shape, con_spans.shape)
         gcn_model_inputs = (tok_length[map_AS], bert_length[map_AS], bert_sequence, bert_segments_ids, word_mapback[map_AS], aspect_token, aspect_mask, src_mask, dep_spans[map_AS], con_spans, amr_spans[map_AS])
         outputs = self.gcn_model(gcn_model_inputs) 
         logits = outputs
@@ -55,9 +52,6 @@ class GCNAbsaModel(nn.Module):
         # gcn layer
         self.gcn = GCNBert(bert, embeddings, opt, opt.num_layers)
 
-        # Interact Module(EMFH)
-        self.ResEMFH = ResEMFH(opt, opt.bert_dim)
-        
         # Hierarchical Fusion Module
         self.HFfusion = HFfusion(opt, opt.bert_dim)
         
@@ -80,18 +74,7 @@ class GCNAbsaModel(nn.Module):
         graph_amr_outputs = (amr_output * aspect_mask).sum(dim=1) / aspect_wn
         graph_know_outputs = know_output
 
-        # Iteract Module
-        if self.opt.fusion_condition == 'ConvIteract':
-            con_fusion_out, dep_fusion_out, seman_fusion_out, know_fusion_out = self.multi_view_fusion(graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_know_outputs)
-
-        elif self.opt.fusion_condition == 'Triaffine':
-            final_output = self.triaffine_Attention(graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_know_outputs)
-        
-        elif self.opt.fusion_condition == 'ResEMFH':
-            final_output = self.ResEMFH(graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_amr_outputs, graph_know_outputs)
-
-        elif self.opt.fusion_condition == 'HF':
-            final_output = self.HFfusion(bert_enc_outputs, graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_amr_outputs, graph_know_outputs)
+        final_output = self.HFfusion(bert_enc_outputs, graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_amr_outputs, graph_know_outputs)
 
         logits = self.classifier(final_output)
 
@@ -108,7 +91,6 @@ class GCNBert(nn.Module):
         self.layernorm = LayerNorm(opt.bert_dim)
 
         # gcn layer
-        self.ConDep_GCNEncoder = ConDep_GCNEncoder(opt.bert_dim, opt.max_num_spans)
         self.GCNEncoder = GCNEncoder(opt.bert_dim, opt.max_num_spans, opt.dep_layers, opt.sem_layers, opt.amr_layers)
         self.attention_heads = opt.attention_heads
         self.attn = MultiHeadAttention(self.attention_heads, self.bert_dim) 
@@ -188,12 +170,9 @@ class GCNBert(nn.Module):
         # GCN Update Module
         dep_matrix = dep_spans
         amr_matrix = amr_spans
-        if self.opt.syn_condition == 'con_dot_dep':
-            condep_out, seman_out = self.ConDep_GCNEncoder(gcn_inputs, con_matirx, dep_matrix, seman_matrix)
 
-        elif self.opt.syn_condition == 'con_and_dep':
-            con_out, dep_out, seman_out, amr_output, multi_loss = self.GCNEncoder(gcn_inputs, con_matirx, dep_matrix, seman_matrix, amr_matrix, tok_length)
-            # print(amr_output)
+        con_out, dep_out, seman_out, amr_output, multi_loss = self.GCNEncoder(gcn_inputs, con_matirx, dep_matrix, seman_matrix, amr_matrix, tok_length)
+        
         return con_out, dep_out, seman_out, amr_output, know_output, gcn_inputs, pooled_output, multi_loss
         
 

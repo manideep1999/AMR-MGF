@@ -25,12 +25,12 @@ class Tokenizer4BertGCN:
 
 
 class ABSAGCNData(Dataset):
-    def __init__(self, fname, tokenizer, opt, dep_vocab):
+    def __init__(self, fname, tokenizer, opt):
         # load raw data
         with open(fname, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
 
-        self.data = self.process(raw_data, tokenizer, opt, dep_vocab)
+        self.data = self.process(raw_data, tokenizer, opt)
 
     def __len__(self):
         return len(self.data)
@@ -38,7 +38,7 @@ class ABSAGCNData(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
     
-    def process(self, raw_data, tokenizer, opt, dep_vocab):
+    def process(self, raw_data, tokenizer, opt):
 
         polarity_dict = {'positive':0, 'negative':1, 'neutral':2}
         max_len = opt.max_length 
@@ -46,6 +46,14 @@ class ABSAGCNData(Dataset):
         SEP_id = tokenizer.convert_tokens_to_ids(["[SEP]"])
         sub_len = len(opt.special_token)
         processed = []
+
+        # Load AMR edge vocabulary if available
+        amr_stoi = None
+        if hasattr(opt, 'amr_edge_stoi') and opt.amr_edge_stoi:
+            try:
+                amr_stoi = torch.load(opt.amr_edge_stoi)
+            except:
+                print("Warning: Could not load AMR edge vocabulary, skipping AMR spans")
 
         for d in raw_data:
             tok = d['token']
@@ -65,6 +73,14 @@ class ABSAGCNData(Dataset):
             dep_head = list(d['dep_head'])[:tok_length]
             dep_spans = head_to_adj_oneshot(dep_head, tok_length, d['aspects'])
 
+            # 4、AMR spans processing (once per sentence)
+            amr_spans = None
+            if amr_stoi and 'amr_edges' in d and 'amr_tokens' in d:
+                amr_spans = self.process_amr_spans(d, tok_length, amr_stoi)
+            else:
+                # Default identity matrix if no AMR data
+                amr_spans = np.eye(tok_length, dtype=np.float32)
+
             # con_spans
             con_head = d['con_head']
             con_mapnode = d['con_mapnode']
@@ -81,6 +97,7 @@ class ABSAGCNData(Dataset):
             aspect_token_list = []
             src_mask_list = []
             con_spans_list = []
+            amr_spans_list = []
 
             for aspect in d['aspects']:
                 asp = list(aspect['term'])
@@ -114,6 +131,9 @@ class ABSAGCNData(Dataset):
                 # 9、src_mask
                 src_mask = [1] * tok_length
 
+                # 10、AMR spans for this aspect (reuse the same matrix for all aspects)
+                amr_spans_list.append(amr_spans)
+
                 # combine
                 bert_sequence_list.append(bert_sequence)
                 bert_segments_ids_list.append(bert_segments_ids)
@@ -126,17 +146,74 @@ class ABSAGCNData(Dataset):
             processed += [
                 (
                     tok_length, bert_length, bert_sequence_list, bert_segments_ids_list, polarity_list,
-                    aspect_token_list, aspect_mask_list, src_mask_list, con_spans_list, dep_spans, word_mapback
+                    aspect_token_list, aspect_mask_list, src_mask_list, con_spans_list, dep_spans, word_mapback, amr_spans_list
                 )
             ]
         return processed
+
+    def process_amr_spans(self, data_item, tok_length, amr_stoi):
+        """
+        Process AMR edges to create adjacency matrix similar to data_utils_kg.py
+        """
+        try:
+            # Initialize adjacency matrix with 'none' edges
+            amr_edge_adj = np.ones((tok_length, tok_length), dtype=int) * amr_stoi.get('none', 0)
+            
+            # Process AMR edges
+            if 'amr_edges' in data_item and data_item['amr_edges']:
+                for edge in data_item['amr_edges']:
+                    if len(edge) >= 3:  # Ensure edge has source, relation, target
+                        source_idx, relation, target_idx = edge[0], edge[1], edge[2]
+                        
+                        # Handle out-of-bounds indices
+                        if source_idx >= tok_length or target_idx >= tok_length:
+                            continue
+                            
+                        # Handle special relation cases
+                        if relation.startswith(':op') and not amr_stoi.get('Ġ' + relation):
+                            relation = ':op5'
+                        if relation.startswith(':snt') and not amr_stoi.get('Ġ' + relation):
+                            relation = ':snt5'
+                        if relation == ':prep-on-behalf-of':
+                            relation = 'behalf'
+                        if relation == ':prep-in-addition-to':
+                            relation = 'addition'
+                        if relation == ':prep-along-with':
+                            relation = 'along'
+                        
+                        # Process different relation types
+                        if relation.startswith(':prep-'):
+                            rel_key = 'Ġ' + relation[6:]
+                            if amr_edge_adj[source_idx][target_idx] == amr_stoi.get('none', 0):
+                                amr_edge_adj[source_idx][target_idx] = amr_stoi.get(rel_key, amr_stoi.get('none', 0))
+                        elif relation.endswith('-of'):
+                            rel_key = 'Ġ' + relation[:-3]
+                            if amr_edge_adj[target_idx][source_idx] == amr_stoi.get('none', 0):
+                                amr_edge_adj[target_idx][source_idx] = amr_stoi.get(rel_key, amr_stoi.get('none', 0))
+                        else:
+                            rel_key = 'Ġ' + relation
+                            if amr_edge_adj[source_idx][target_idx] == amr_stoi.get('none', 0):
+                                amr_edge_adj[source_idx][target_idx] = amr_stoi.get(rel_key, amr_stoi.get('none', 0))
+            
+            # Remove self-loops from diagonal
+            amr_edge_adj -= np.diag(np.diag(amr_edge_adj))
+            
+            # Add self-loop edges
+            amr_edge_adj = amr_edge_adj + np.eye(amr_edge_adj.shape[0]) * amr_stoi.get('self', 1)
+            
+            return amr_edge_adj.astype(np.float32)
+            
+        except Exception as e:
+            print(f"Warning: Error processing AMR edges: {e}")
+            # Return identity matrix as fallback
+            return np.eye(tok_length, dtype=np.float32)
 
 def ABSA_collate_fn(batch):
     batch_size = len(batch)
     batch = list(zip(*batch))
 
     (tok_length_, bert_length_, bert_sequence_list_, bert_segments_ids_, polarity_list_,
-                    aspect_token_list_, aspect_mask_list_, src_mask_list_, con_spans_list_, dep_spans_, word_mapback_) = batch
+                    aspect_token_list_, aspect_mask_list_, src_mask_list_, con_spans_list_, dep_spans_, word_mapback_, amr_spans_list_) = batch
     
     # sequence max length
     lens = batch[0]
@@ -158,12 +235,30 @@ def ABSA_collate_fn(batch):
         dep_spans[idx,:mlen,:mlen] = dep_spans_[idx]
     dep_spans = torch.FloatTensor(dep_spans)
 
-    # as_batch_size
+    # as_batch_size (moved before AMR processing)
     map_AS = [[idx] * len(a_i) for idx, a_i in enumerate(bert_sequence_list_)]
     map_AS_idx = [range(len(a_i)) for a_i in bert_sequence_list_]
     map_AS = torch.LongTensor([m for m_list in map_AS for m in m_list])
     map_AS_idx = torch.LongTensor([m for m_list in map_AS_idx for m in m_list])
     as_batch_size = len(map_AS)
+
+    # AMR spans processing
+    # Since each batch item's amr_spans_list_ contains matrices (one per aspect), 
+    # we need to expand to as_batch_size like other aspect-level data
+    amr_spans_flat = [amr_matrix for amr_list in amr_spans_list_ for amr_matrix in amr_list]
+    amr_spans = np.zeros((as_batch_size, max_lens, max_lens), dtype=np.float32)
+    for idx in range(as_batch_size):
+        if idx < len(amr_spans_flat) and amr_spans_flat[idx] is not None:
+            amr_matrix = amr_spans_flat[idx]
+            mlen = min(amr_matrix.shape[0], max_lens)
+            amr_spans[idx, :mlen, :mlen] = amr_matrix[:mlen, :mlen]
+        else:
+            # Default to identity matrix
+            # Map back to original batch to get correct token length
+            batch_idx = map_AS[idx].item() if idx < len(map_AS) else 0
+            mlen = min(tok_length_[batch_idx], max_lens)
+            amr_spans[idx, :mlen, :mlen] = np.eye(mlen)
+    amr_spans = torch.FloatTensor(amr_spans)
 
     # bert_sequence_list
     bert_sequence = [p for p_list in bert_sequence_list_ for p in p_list]
@@ -199,7 +294,7 @@ def ABSA_collate_fn(batch):
 
     return  (
         tok_length, bert_length, bert_sequence, bert_segments_ids, word_mapback, map_AS,\
-        aspect_token_list, aspect_mask, src_mask, dep_spans, con_spans, polarity
+        aspect_token_list, aspect_mask, src_mask, dep_spans, con_spans, amr_spans, polarity
     )
 
     
@@ -395,17 +490,3 @@ def form_aspect_related_spans(aspect_node_idx, spans, mapnode, node2layerid, pat
                 span_indications.append(mapnode[f][:-len(special_token)])
         
     return spans_range, span_indications
-
-    
-def build_senticNet():
-    file_path = ['./dataset/opinion_lexicon/SenticNet/negative.txt',
-                 './dataset/opinion_lexicon/SenticNet/positive.txt']
-    datalist1 = [x.strip().split('\t') for x in open(file_path[0]).readlines()]
-    datalist2 = [x.strip().split('\t') for x in open(file_path[1]).readlines()]
-    data_list = datalist1 + datalist2
-    lexicon_dict = {}
-    for key, val in data_list:
-        lexicon_dict[key] = abs(float(val))
-        # lexicon_dict[key] = float(val)
-    return lexicon_dict
-    
