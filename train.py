@@ -20,9 +20,17 @@ from data_utils1 import build_senticNet, Tokenizer4BertGCN, ABSAGCNData, ABSA_co
 from prepare_vocab import VocabHelp
 from tensorboardX import SummaryWriter
 
+# Configure logging first before creating any loggers
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)  # Set to DEBUG to see KG loss details
 logger.addHandler(logging.StreamHandler(sys.stdout))
+
+# Also specifically enable debug logging for the models.layer module
+models_logger = logging.getLogger('models.layer')
+models_logger.setLevel(logging.DEBUG)
+
 writer = SummaryWriter('curvs')
 import wandb
 wandb.login()
@@ -112,6 +120,7 @@ class Instructor:
                 outputs, multi_loss = self.model(inputs)          
                 Lc = self.criterion(outputs.view(-1, 3), targets.view(-1))
                 Ldep = multi_loss
+                # print(Ldep)
                 loss = self.opt.gamma * Lc + self.opt.theta * Ldep
 
                 loss.backward()
@@ -276,6 +285,11 @@ def main():
     parser.add_argument('--theta', default=0, type=float, help="The balance of root loss.")
     parser.add_argument('--alpha', default=0, type=float, help="The balance of root loss.")
     
+    # Loss scaling parameters for individual components
+    parser.add_argument('--lambda_dep', default=1.0, type=float, help="Scaling factor for DEP-CON contrastive loss.")
+    parser.add_argument('--lambda_amr', default=1.0, type=float, help="Scaling factor for AMR contrastive loss.")
+    parser.add_argument('--lambda_kg_scalar', default=1.0, type=float, help="Scaling factor for Knowledge-Text alignment loss.")
+        
     # * bert
     parser.add_argument('--pretrained_bert_name', default='bert-base-uncased', type=str)
     parser.add_argument('--adam_epsilon', default=1e-8, type=float, help="Epsilon for Adam optimizer.")

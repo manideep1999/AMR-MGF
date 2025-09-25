@@ -7,9 +7,7 @@ import torch
 import copy
 import torch.nn as nn
 import torch.nn.functional as F
-from .attention import StructuredAttention as StructuredAtt 
 from .layer import *
-from .affine import Biaffine, Triaffine
 
 
 class LayerNorm(nn.Module):
@@ -55,13 +53,33 @@ class GCNAbsaModel(nn.Module):
         # gcn layer
         self.gcn = GCNBert(bert, embeddings, opt, opt.num_layers)
 
-        # Interact Module(EMFH)
-        self.ResEMFH = ResEMFH(opt, opt.bert_dim)
-        
         # Hierarchical Fusion Module
         self.HFfusion = HFfusion(opt, opt.bert_dim)
         
-        self.classifier = nn.Linear(opt.bert_dim, opt.polarities_dim)
+        # Determine classifier input dimension based on fusion_condition
+        classifier_dim = self._get_classifier_input_dim(opt)
+        self.classifier = nn.Linear(classifier_dim, opt.polarities_dim)
+
+    def _get_classifier_input_dim(self, opt):
+        """Calculate the input dimension for classifier based on fusion_condition"""
+        bert_dim = opt.bert_dim
+        
+        if not hasattr(opt, 'fusion_condition') or opt.fusion_condition == 'HF':
+            return bert_dim  # Original HF returns bert_dim
+        elif opt.fusion_condition == "CD" or opt.fusion_condition == "A+K":
+            # CD → Constituency + Dependency or A + K → AMR + Knowledge Graph
+            return bert_dim * 2
+        elif opt.fusion_condition == "A" or  opt.fusion_condition == "K":
+            # A → AMR or K → Knowledge Graph
+            return bert_dim
+        elif opt.fusion_condition == "CD+A" or opt.fusion_condition == "CD+K":
+            # CD + A → Constituency + Dependency + AMR or CD + K → Constituency + Dependency + Knowledge Graph
+            return bert_dim * 3
+        elif opt.fusion_condition == "CD+A+K":
+            # CD + A + K → Constituency + Dependency + AMR + Knowledge Graph
+            return bert_dim * 4
+        else:
+            return bert_dim  # Default to BERT dimension
 
     def forward(self, inputs):
         tok_length, bert_length, bert_sequence, bert_segments_ids, word_mapback, aspect_token, aspect_mask, src_mask, dep_spans, con_spans, amr_spans = inputs           # unpack inputs
@@ -80,18 +98,7 @@ class GCNAbsaModel(nn.Module):
         graph_amr_outputs = (amr_output * aspect_mask).sum(dim=1) / aspect_wn
         graph_know_outputs = know_output
 
-        # Iteract Module
-        if self.opt.fusion_condition == 'ConvIteract':
-            con_fusion_out, dep_fusion_out, seman_fusion_out, know_fusion_out = self.multi_view_fusion(graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_know_outputs)
-
-        elif self.opt.fusion_condition == 'Triaffine':
-            final_output = self.triaffine_Attention(graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_know_outputs)
-        
-        elif self.opt.fusion_condition == 'ResEMFH':
-            final_output = self.ResEMFH(graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_amr_outputs, graph_know_outputs)
-
-        elif self.opt.fusion_condition == 'HF':
-            final_output = self.HFfusion(bert_enc_outputs, graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_amr_outputs, graph_know_outputs)
+        final_output = self.HFfusion(bert_enc_outputs, graph_con_outputs, graph_dep_outputs, graph_seman_outputs, graph_amr_outputs, graph_know_outputs)
 
         logits = self.classifier(final_output)
 
@@ -108,8 +115,7 @@ class GCNBert(nn.Module):
         self.layernorm = LayerNorm(opt.bert_dim)
 
         # gcn layer
-        self.ConDep_GCNEncoder = ConDep_GCNEncoder(opt.bert_dim, opt.max_num_spans)
-        self.GCNEncoder = GCNEncoder(opt.bert_dim, opt.max_num_spans, opt.dep_layers, opt.sem_layers, opt.amr_layers)
+        self.GCNEncoder = GCNEncoder(opt.bert_dim, opt.max_num_spans, opt.dep_layers, opt.sem_layers, opt.amr_layers, kg_dim=opt.dim_k)
         self.attention_heads = opt.attention_heads
         self.attn = MultiHeadAttention(self.attention_heads, self.bert_dim) 
         self.dense = nn.Linear(opt.bert_dim, opt.hidden_dim)
@@ -188,14 +194,12 @@ class GCNBert(nn.Module):
         # GCN Update Module
         dep_matrix = dep_spans
         amr_matrix = amr_spans
-        if self.opt.syn_condition == 'con_dot_dep':
-            condep_out, seman_out = self.ConDep_GCNEncoder(gcn_inputs, con_matirx, dep_matrix, seman_matrix)
 
-        elif self.opt.syn_condition == 'con_and_dep':
-            con_out, dep_out, seman_out, amr_output, multi_loss = self.GCNEncoder(gcn_inputs, con_matirx, dep_matrix, seman_matrix, amr_matrix, tok_length)
+        # Pass knowledge embeddings to GCNEncoder for KG loss computation
+        con_out, dep_out, seman_out, amr_output, multi_loss = self.GCNEncoder(gcn_inputs, con_matirx, dep_matrix, seman_matrix, amr_matrix, tok_length, knowledge_embedding, self.opt)
             # print(amr_output)
         return con_out, dep_out, seman_out, amr_output, know_output, gcn_inputs, pooled_output, multi_loss
-        
+
 
 
 

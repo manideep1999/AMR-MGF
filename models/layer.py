@@ -17,7 +17,7 @@ from pytorch_metric_learning.regularizers import LpRegularizer
 
 # con, dep and seman update module
 class GCNEncoder(nn.Module):
-    def __init__(self, emb_dim, con_layers, dep_layers, sem_layers, amr_layers = 9, gcn_dropout=0.1):
+    def __init__(self, emb_dim, con_layers, dep_layers, sem_layers, amr_layers = 9, kg_dim=200, gcn_dropout=0.1):
         super().__init__()
         self.con_layers = con_layers
         self.dep_layers = dep_layers
@@ -26,6 +26,11 @@ class GCNEncoder(nn.Module):
 
         self.emb_dim = emb_dim
         self.out_dim = emb_dim
+        self.kg_dim = kg_dim
+        
+        # Add text to KG projection layer
+        self.text_to_kg_proj = nn.Linear(emb_dim, kg_dim)
+        
         # gcn layer
         self.W_con = nn.ModuleList()
         self.W_dep = nn.ModuleList()
@@ -45,7 +50,7 @@ class GCNEncoder(nn.Module):
             self.W_amr.append(nn.Linear(input_dim, input_dim))
         self.gcn_drop = nn.Dropout(gcn_dropout)        
 
-    def forward(self, inputs, con_adj, dep_adj, seman_adj, amr_adj, tok_length):
+    def forward(self, inputs, con_adj, dep_adj, seman_adj, amr_adj, tok_length, knowledge_embeddings=None, opt=None):
         # gcn layer
         con_input, dep_input, seman_input, amr_input = inputs, inputs, inputs, inputs
         
@@ -92,93 +97,251 @@ class GCNEncoder(nn.Module):
             amr_gAxW = F.relu(amr_AxW)
             amr_input = self.gcn_drop(amr_gAxW) if index < self.amr_layers - 1 else amr_gAxW
 
+        # choose the text branch you want to align to KG (dep_input is fine)
+        kg_loss = torch.zeros((), device=inputs.device)
+        if knowledge_embeddings is not None:
+            # Optional: warm-up to avoid early domination
+            kg_temp       = getattr(opt, 'kg_temperature', 0.07)
+            kg_sym        = getattr(opt, 'kg_symmetrize', True)
+            kg_detach     = getattr(opt, 'kg_detach_teacher', True)
+            kg_ls         = getattr(opt, 'kg_label_smoothing', 0.0)
+            kg_weight     = getattr(opt, 'lambda_kg', 1.0)
+            warm_steps    = getattr(opt, 'kg_warmup_steps', 0)
+            global_step   = getattr(opt, 'global_step', 0)
+
+            kg_w = kg_weight
+            if warm_steps and warm_steps > 0:
+                # linear ramp from 0 -> kg_weight
+                kg_w = kg_weight * min(1.0, float(global_step) / float(warm_steps))
+
+            kg_loss_val = kg_alignment_loss_inbatch(
+                text_feats=dep_input,                 # or your fused text reps
+                kg_feats=knowledge_embeddings,
+                tok_len=tok_length,
+                text_to_kg_proj=self.text_to_kg_proj,
+                temperature=kg_temp,
+                symmetrize=kg_sym,
+                detach_kg=kg_detach,
+                label_smoothing=kg_ls,
+            )
+            kg_loss = kg_w * kg_loss_val
         # print(amr_input)
-        multi_loss = process_adj_matrices(dep_adj, con_adj[0].bool().float(), seman_adj, amr_adj, con_input, dep_input, amr_input, tok_length)
+        multi_loss = process_adj_matrices(dep_adj, con_adj[0].bool().float(), seman_adj, amr_adj, con_input, dep_input, amr_input, tok_length, knowledge_embeddings=None, opt=opt)
         # print(multi_loss)
-        return con_input, dep_input, seman_input, amr_input, multi_loss
+        if opt is not None:
+            kg_loss *= getattr(opt, 'lambda_kg_scalar', 1.0)
+        total_loss = multi_loss + kg_loss
+        # print('multi_loss:', multi_loss.item(), 'kg_loss:', kg_loss.item(), 'total_loss:', total_loss.item())
+        return con_input, dep_input, seman_input, amr_input, total_loss    
     
-def process_adj_matrices(dep_adj, con_adj_new, seman_adj, amr_adj, con_input, dep_input, amr_input, tok_len):
+def process_adj_matrices(dep_adj, con_adj_new, seman_adj, amr_adj, con_input, dep_input, amr_input, tok_len, knowledge_embeddings=None, opt=None):
     batch_size, max_length, _ = dep_adj.size()
     
-    multi_viewdep_loss = 0
-    multi_viewamr_loss = 0  # NEW: accumulate AMR-related loss
+    multi_viewdep_loss = 0.0
+    multi_viewamr_loss = 0.0
+
+    dep_denom = dep_adj.sum(2).unsqueeze(2) + 1  # (B,T,1) if needed later
+    amr_denom = amr_adj.sum(2).unsqueeze(2) + 1
 
     for b in range(batch_size):
         length = int(tok_len[b])
 
-        # Slice the tensors to the required length
-        dep_adj_batch = dep_adj[b, :length, :length].to(dtype=torch.int)
-        con_adj_new_batch = con_adj_new[b, :length, :length].to(dtype=torch.int)
-        sem_adj_batch = seman_adj[b, :length, :length]
-        amr_adj_batch = amr_adj[b, :length, :length].to(dtype=torch.int)  # AMR ADJ
+        dep_adj_batch  = dep_adj[b, :length, :length].to(dtype=torch.int)
+        con_adj_batch  = con_adj_new[b, :length, :length].to(dtype=torch.int)
+        sem_adj_batch  = seman_adj[b, :length, :length]
+        amr_adj_batch  = amr_adj[b, :length, :length].to(dtype=torch.int)
 
-        # caculate importance scores
+        # importance
         node_importance_scores = sem_adj_batch.mean(dim=1) + sem_adj_batch.max(dim=1).values
-        k = int(math.log10(length) ** 2)
-
+        k = max(1, int((math.log10(max(2, length))) ** 2))  # guard
         top_k_node = torch.topk(node_importance_scores, k).indices.tolist()
 
         dep_non_zero_indices = torch.nonzero(dep_adj_batch)
-        con_non_zero_indices = torch.nonzero(con_adj_new_batch)
-
+        con_non_zero_indices = torch.nonzero(con_adj_batch)
         dep_edges_tuple = dep_non_zero_indices.t()
         con_edges_tuple = con_non_zero_indices.t()
 
         dep_1_start = dep_edges_tuple[0]
-        dep_1_end = dep_edges_tuple[1]
-
+        dep_1_end   = dep_edges_tuple[1]
         dep_3_start, dep_3_end = get_2nd_order_pairs(con_edges_tuple, dep_edges_tuple)
 
-        multi_Dep_loss = 0
+        dep_loss_sum = 0.0
+        amr_loss_sum = 0.0
 
         for i in top_k_node:
-            # DEP-CON
+            # ---- DEP-CON contrast ----
             Anchor_Dep = dep_input[b, i]
             AD_dep_view_node_index = dep_1_end[dep_1_start == i]
             AD_con_view_node_index = dep_3_end[dep_3_start == i]
 
-            AD_dep_view_node = dep_input[b, AD_dep_view_node_index]
-            AD_remaining_indices_inter = torch.nonzero(~AD_dep_view_node_index.new_full((length,), 0, dtype=torch.bool)).squeeze()
-            AD_dep_view_node_remain = dep_input[b, AD_remaining_indices_inter]
+            AD_dep_view_node = dep_input[b, AD_dep_view_node_index] if AD_dep_view_node_index.numel() > 0 else Anchor_Dep.unsqueeze(0)
+            # negatives are "everything else" (simple, stable mask)
+            all_idx = torch.arange(length, device=dep_input.device)
+            dep_neg_mask = torch.ones(length, dtype=torch.bool, device=dep_input.device)
+            dep_neg_mask[AD_dep_view_node_index] = False
+            dep_neg = dep_input[b, all_idx[dep_neg_mask]]
 
-            # inter-inter
-            AD_con_view_node_index = torch.cat((AD_con_view_node_index, torch.tensor([i]).cuda()))
-            AD_con_view_node = con_input[b, AD_con_view_node_index]
-            AD_remaining_indices_intra = torch.nonzero(~AD_con_view_node_index.new_full((length,), 0, dtype=torch.bool)).squeeze()
-            AD_con_view_node_remain = dep_input[b, AD_remaining_indices_intra]
+            AD_con_view_node_index = torch.cat((AD_con_view_node_index, torch.tensor([i], device=dep_input.device)))
+            AD_con_view_node = con_input[b, AD_con_view_node_index] if AD_con_view_node_index.numel() > 0 else Anchor_Dep.unsqueeze(0)
+            con_neg_mask = torch.ones(length, dtype=torch.bool, device=dep_input.device)
+            con_neg_mask[AD_con_view_node_index] = False
+            con_neg = dep_input[b, all_idx[con_neg_mask]]
 
-            # total
             AD_P = torch.cat((AD_dep_view_node, AD_con_view_node), dim=0)
-            AD_N = torch.cat((AD_dep_view_node_remain, AD_con_view_node_remain), dim=0)
+            AD_N = torch.cat((dep_neg, con_neg), dim=0)
 
-            AD_loss = multi_margin_contrastive_loss(Anchor_Dep, AD_P, AD_N)
+            dep_loss_sum += multi_margin_contrastive_loss(Anchor_Dep, AD_P, AD_N)
 
-            multi_Dep_loss += AD_loss
+            # ---- AMR contrast ----
+            Anchor_AMR = amr_input[b, i]
+            amr_pos_idx = (amr_adj_batch[i] > 0).nonzero(as_tuple=True)[0]
+            amr_pos_idx = amr_pos_idx[amr_pos_idx != i]
+            AMR_pos = amr_input[b, amr_pos_idx] if amr_pos_idx.numel() > 0 else Anchor_AMR.unsqueeze(0)
 
-            # ----------------------
-            # AMR CONTRASTIVE LOSS
-            # ----------------------
-            # Anchor_AMR = amr_input[b, i]
-            # amr_view_node_index = (amr_adj_batch[i] > 0).nonzero(as_tuple=True)[0]
-            # # Remove self-loop if you don't want the anchor as its own positive
-            # amr_view_node_index = amr_view_node_index[amr_view_node_index != i]
-            # AMR_view_node = amr_input[b, amr_view_node_index] if amr_view_node_index.numel() > 0 else Anchor_AMR.unsqueeze(0)
+            amr_all = torch.arange(length, device=amr_input.device)
+            amr_neg_idx = amr_all[~torch.isin(amr_all, amr_pos_idx)]
+            AMR_neg = amr_input[b, amr_neg_idx] if amr_neg_idx.numel() > 0 else Anchor_AMR.unsqueeze(0)
 
-            # # Negative: all nodes NOT in amr_view_node_index
-            # all_indices = torch.arange(length, device=amr_input.device)
-            # neg_indices = all_indices[~torch.isin(all_indices, amr_view_node_index)]
-            # AMR_view_node_neg = amr_input[b, neg_indices] if neg_indices.numel() > 0 else Anchor_AMR.unsqueeze(0)
+            amr_loss_sum += multi_margin_contrastive_loss(Anchor_AMR, AMR_pos, AMR_neg)
 
-            # # Compute contrastive loss for AMR
-            # AMR_loss = multi_margin_contrastive_loss(Anchor_AMR, AMR_view_node, AMR_view_node_neg)
-            # multi_viewamr_loss += AMR_loss
-            # print(f"Batch {b}, Node {i}: AMR Loss: {AMR_loss.item()}, Dep Loss: {AD_loss.item()}")
-            # breakpoint()
+        if opt is not None:
+            dep_loss_sum *= getattr(opt, 'lambda_dep', 1.0)
+            amr_loss_sum *= getattr(opt, 'lambda_amr', 1.0)
 
-        # multi_viewdep_loss += multi_Dep_loss + multi_viewamr_loss
-        multi_viewdep_loss += multi_Dep_loss
+        multi_viewdep_loss += dep_loss_sum
+        multi_viewamr_loss += amr_loss_sum
 
-    return multi_viewdep_loss
+    # return DEP/AMR; KG will be computed in-batch elsewhere
+    return multi_viewdep_loss + multi_viewamr_loss
+
+def _flatten_valid_tokens(x, tok_len):
+    """
+    x: (B, T, D), tok_len: (B,)
+    returns: (N, D) flattened valid tokens
+    """
+    B, T, D = x.size()
+    mask = torch.arange(T, device=x.device).unsqueeze(0) < tok_len.unsqueeze(1)  # (B, T)
+    return x[mask]  # (N, D)
+
+def knowledge_text_alignment_loss(text_anchor, kg_anchor, kg_positives, kg_negatives, margin=0.3, temperature=0.5):
+    """
+    SIMPLIFIED and STABLE text-knowledge alignment loss with better gradient flow
+    """
+    # Simplified deterministic dimension matching
+    if text_anchor.size(-1) != kg_anchor.size(-1):
+        target_dim = kg_anchor.size(-1)
+        source_dim = text_anchor.size(-1)
+        
+        if source_dim > target_dim:
+            # Simple linear projection for downsampling (learnable but fixed)
+            # Use mean pooling over chunks for better information preservation
+            chunk_size = source_dim // target_dim
+            text_anchor_proj = text_anchor.view(-1, chunk_size).mean(dim=1)[:target_dim]
+        else:
+            # Simple repetition for upsampling
+            text_anchor_proj = text_anchor.repeat((target_dim + source_dim - 1) // source_dim)[:target_dim]
+    else:
+        text_anchor_proj = text_anchor
+    
+    # Normalize all features for cosine similarity
+    text_norm = F.normalize(text_anchor_proj, p=2, dim=-1, eps=1e-8)
+    kg_anchor_norm = F.normalize(kg_anchor, p=2, dim=-1, eps=1e-8)
+    kg_pos_norm = F.normalize(kg_positives, p=2, dim=-1, eps=1e-8)
+    kg_neg_norm = F.normalize(kg_negatives, p=2, dim=-1, eps=1e-8)
+    
+    # Compute similarities
+    text_kg_sim = F.cosine_similarity(text_norm.unsqueeze(0), kg_anchor_norm.unsqueeze(0), dim=-1)
+    pos_sims = F.cosine_similarity(text_norm.unsqueeze(0), kg_pos_norm, dim=-1)
+    neg_sims = F.cosine_similarity(text_norm.unsqueeze(0), kg_neg_norm, dim=-1)
+    
+    # STABLE: Use InfoNCE-style contrastive loss with proper temperature
+    # Compute logits for all positive and negative samples
+    all_sims = torch.cat([pos_sims, neg_sims], dim=0) / temperature
+    
+    # Create labels: 1 for positives, 0 for negatives
+    num_pos = pos_sims.size(0)
+    num_neg = neg_sims.size(0)
+    labels = torch.zeros(num_pos + num_neg, device=all_sims.device)
+    labels[:num_pos] = 1.0
+    
+    # InfoNCE loss: encourage high similarity with positives, low with negatives
+    pos_logits = all_sims[:num_pos]
+    neg_logits = all_sims[num_pos:]
+    
+    # Compute InfoNCE loss more stably
+    pos_exp = torch.exp(pos_logits).mean()
+    neg_exp = torch.exp(neg_logits).mean()
+    infonce_loss = -torch.log(pos_exp / (pos_exp + neg_exp + 1e-8))
+    
+    # Simple margin loss for text-kg anchor alignment
+    margin_loss = torch.clamp(margin - text_kg_sim, min=0).mean()
+    
+    # Balanced combination with reduced weights for stability
+    total_loss = 0.6 * infonce_loss + 0.4 * margin_loss
+    
+    # Add small regularization to prevent mode collapse
+    diversity_loss = -torch.var(pos_sims) * 0.01  # Encourage diversity in positive similarities
+    
+    return total_loss + diversity_loss
+
+def kg_alignment_loss_inbatch(
+    text_feats,               # (B, T, D_text)  e.g., dep_input or your fused text reps
+    kg_feats,                 # (B, T, D_kg)    external KG embeddings aligned to tokens
+    tok_len,                  # (B,)
+    text_to_kg_proj,          # nn.Linear(D_text -> D_kg)
+    temperature=0.07,
+    symmetrize=True,
+    detach_kg=True,
+    label_smoothing=0.0,
+):
+    """
+    In-batch InfoNCE between projected text and KG.
+    Positive = same position token pair; Negatives = all other tokens in batch.
+    We detach KG branch to stabilize (teacher signal).
+    """
+    # 1) gather only valid tokens across batch
+    t_flat = _flatten_valid_tokens(text_feats, tok_len)          # (N, D_text)
+    k_flat = _flatten_valid_tokens(kg_feats, tok_len)            # (N, D_kg)
+    if t_flat.numel() == 0:
+        return torch.zeros((), device=text_feats.device, dtype=text_feats.dtype)
+
+    # 2) project text into KG dim and L2-normalize both
+    t_proj = text_to_kg_proj(t_flat)                             # (N, D_kg)
+    t_proj = torch.nn.functional.normalize(t_proj, p=2, dim=-1)
+    if detach_kg:
+        k_flat = k_flat.detach()
+    k_flat = torch.nn.functional.normalize(k_flat, p=2, dim=-1)
+
+    # 3) similarity logits (N x N) with temperature
+    logits = (t_proj @ k_flat.t()) / temperature                 # (N, N)
+
+    # 4) diagonal are the positives
+    targets = torch.arange(logits.size(0), device=logits.device)
+
+    # optional label smoothing
+    if label_smoothing and label_smoothing > 0.0:
+        # manual LS: one-hot with smoothing
+        eps = label_smoothing
+        N = logits.size(0)
+        with torch.no_grad():
+            soft_targets = torch.full_like(logits, fill_value=eps / (N - 1))
+            soft_targets.scatter_(1, targets.view(-1,1), 1.0 - eps)
+        log_probs = torch.log_softmax(logits, dim=1)
+        loss_t2k = -(soft_targets * log_probs).sum(dim=1).mean()
+    else:
+        loss_t2k = torch.nn.functional.cross_entropy(logits, targets)
+
+    if symmetrize:
+        # KG->Text direction (share same targets)
+        logits_k2t = logits.t()
+        if label_smoothing and label_smoothing > 0.0:
+            log_probs_kt = torch.log_softmax(logits_k2t, dim=1)
+            loss_k2t = -(soft_targets * log_probs_kt).sum(dim=1).mean()
+        else:
+            loss_k2t = torch.nn.functional.cross_entropy(logits_k2t, targets)
+        return 0.5 * (loss_t2k + loss_k2t)
+    else:
+        return loss_t2k
 
 def multi_margin_contrastive_loss(anchor, positives, negatives, margin=0.2):
     dist_pos = F.pairwise_distance(anchor.unsqueeze(0), positives).mean()
@@ -205,90 +368,6 @@ def get_2nd_order_pairs(edge_list1, edge_list2):
     list1, list2 = list1.to(torch.int64), list2.to(torch.int64)
 
     return list1, list2
-
-# condep and seman update module
-class ConDep_GCNEncoder(nn.Module):
-    def __init__(self, emb_dim=768, num_layers=3,gcn_dropout=0.1):
-        super().__init__()
-        self.layers = num_layers
-        self.emb_dim = emb_dim
-        self.out_dim = emb_dim
-        # gcn layer
-        self.W = nn.ModuleList()
-        for layer in range(self.layers):
-            input_dim = self.emb_dim if layer == 0 else self.out_dim
-            self.W.append(nn.Linear(input_dim, input_dim))
-        self.gcn_drop = nn.Dropout(gcn_dropout)
-
-    def forward(self, inputs, con_adj, dep_adj, seman_adj):
-        # gcn layer
-        condep_input, seman_input = inputs, inputs
-
-        # seman denom
-        seman_denom = seman_adj.sum(2).unsqueeze(2) + 1
-
-        for index in range(self.layers):
-            con_adj_new = con_adj[index].bool().float()
-            condep_adj = con_adj_new * dep_adj
-            condep_denom = condep_adj.sum(2).unsqueeze(2) + 1
-
-            # condep
-            condep_Ax = condep_adj.bmm(condep_input)
-            condep_AxW = self.W[index](condep_Ax)
-            condep_AxW = condep_AxW + self.W[index](condep_input)  # self loop
-            condep_AxW = condep_AxW / condep_denom
-            condep_gAxW = F.relu(condep_AxW)
-            condep_input = self.gcn_drop(condep_gAxW) if index < self.layers - 1 else condep_gAxW
-
-            # seman
-            seman_Ax = seman_adj.bmm(seman_input)
-            seman_AxW = self.W[index](seman_Ax)
-            seman_AxW = seman_AxW + self.W[index](seman_input)  # self loop
-            seman_AxW = seman_AxW / seman_denom
-            seman_gAxW = F.relu(seman_AxW)
-            seman_input = self.gcn_drop(seman_gAxW) if index < self.layers - 1 else seman_gAxW
-
-        # feature projection loss
-        f_p_condep = condep_input
-        f_c_seman = seman_input
-        f_p_condep_ = proj(f_p_condep, f_c_seman)
-        f_pcondep_tilde = proj(f_p_condep, (f_p_condep - f_p_condep_))
-
-        return f_pcondep_tilde, seman_input
-
-# traditional gcn module
-class GCN(nn.Module):
-
-    def __init__(self, emb_dim=768, num_layers=2,gcn_dropout=0.1):
-        super(GCN, self).__init__()
-        self.layers = num_layers
-        self.emb_dim = emb_dim
-        self.out_dim = emb_dim
-        # gcn layer
-        self.W = nn.ModuleList()
-        for layer in range(self.layers):
-            input_dim = self.emb_dim if layer == 0 else self.out_dim
-            self.W.append(nn.Linear(input_dim, input_dim))
-        self.gcn_drop = nn.Dropout(gcn_dropout)
-
-
-    def forward(self, inputs, adj):
-        # gcn layer
-        
-        denom = adj.sum(2).unsqueeze(2) + 1
-        # mask = (adj.sum(2) + adj.sum(1)).eq(0).unsqueeze(2)
-
-        for l in range(self.layers):
-            Ax = adj.bmm(inputs)
-            AxW = self.W[l](Ax)
-            AxW = AxW + self.W[l](inputs)  # self loop
-            AxW = AxW / denom
-            gAxW = F.relu(AxW)
-            inputs = self.gcn_drop(gAxW) if l < self.layers - 1 else gAxW
-
-        return inputs
-    
-
 
 # multi-head attention layer
 class MultiHeadAttention(nn.Module):
@@ -362,21 +441,21 @@ def get_embedding(vocab, opt):
     graph_emb=0
 
     if 'laptop' in opt.dataset:
-        graph_file = 'embeddings/entity_embeddings_analogy_400.txt'
+        graph_file = './embeddings/entity_embeddings_analogy_400.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_analogy.pkl' % opt.dataset
         else:
             graph_pkl = 'embeddings/%s_graph_analogy_bert.pkl' % opt.dataset
         # graph_pkl = 'embeddings/%s_graph_analogy_roberta.pkl' % ds_name
     elif 'restaurant' in opt.dataset:
-        graph_file = 'embeddings/entity_embeddings_distmult_200.txt'
+        graph_file = './embeddings/entity_embeddings_distmult_200.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_dismult.pkl' % opt.dataset
         else:
             graph_pkl = 'embeddings/%s_graph_dismult_bert.pkl' % opt.dataset
         # graph_pkl = 'embeddings/%s_graph_dismult_roberta.pkl' % ds_name
     elif 'twitter' in opt.dataset:
-        graph_file = 'embeddings/entity_embeddings_distmult_200.txt'
+        graph_file = './embeddings/entity_embeddings_distmult_200.txt'
         if opt.is_bert==0:
             graph_pkl = 'embeddings/%s_graph_dismult.pkl' % opt.dataset
         else:
@@ -515,281 +594,6 @@ class DynamicLSTM(nn.Module):
                 ct = torch.transpose(ct, 0, 1)
 
             return out, (ht, ct)
-        
-class ConvInteract(nn.Module):
-    def __init__(self, hidden_dim):
-        super(ConvInteract, self).__init__()
-
-        self.hidden_dim = hidden_dim
-
-        # Define residual connections and LayerNorm layers
-        self.residual_layer1 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
-                                             nn.ReLU(),
-                                             nn.Linear(hidden_dim, hidden_dim),
-                                             nn.LayerNorm(hidden_dim))
-        self.residual_layer2 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
-                                             nn.ReLU(),
-                                             nn.Linear(hidden_dim, hidden_dim),
-                                             nn.LayerNorm(hidden_dim))
-        self.residual_layer3 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
-                                             nn.ReLU(),
-                                             nn.Linear(hidden_dim, hidden_dim),
-                                             nn.LayerNorm(hidden_dim))
-        
-        # self.linear = nn.Linear(self.hidden_dim, self.hidden_dim)
-
-        self.GatedGCN = GatedGCN(hidden_dim, hidden_dim)
-
-        # Fusion layer
-        self.lstm = nn.LSTM(self.hidden_dim*2, self.hidden_dim, 2, batch_first=True,
-                            bidirectional=True)
-
-        # MLP
-        self.feature_fusion = nn.Sequential(nn.Linear(hidden_dim*2, hidden_dim),
-                                             nn.ReLU(),
-                                             nn.Linear(hidden_dim, hidden_dim),
-                                             nn.LayerNorm(hidden_dim))
-
-    def forward(self, h_feature, h_con, h_dep, h_seman):
-
-        h_con_inter, h_dep_inter, h_seman_inter = self.GatedGCN(h_con, h_dep, h_seman)
-
-        # residual enhanced layer
-        h_con_new = self.residual_layer1(h_feature + h_con_inter)
-        h_dep_new = self.residual_layer2(h_feature + h_dep_inter)
-        h_seman_new = self.residual_layer3(h_feature + h_seman_inter)
-
-        # concat = torch.cat([h_syn_feature, h_sem_feature], dim=2)
-        # output, _ = self.lstm(concat)
-        # h_fusion = self.feature_fusion(output)
-
-        return h_con_new, h_dep_new, h_seman_new
-    
-class FeatureStacking(nn.Module):
-    def __init__(self, hidden_dim):
-        super(FeatureStacking, self).__init__()
-        self.hidden_dim = hidden_dim
-
-    def forward(self, input1, input2):
-        # stack the three input features along the third dimension to form a new tensor with dimensions [a, b, c, hidden_dim]
-        # stacked_input = torch.stack([input1, input2, input3, input4], dim=3)
-        stacked_input = torch.stack([input1, input2], dim=3)
-
-        # apply average pooling along the fourth dimension to obtain a tensor with dimensions [a, b, c, 1]
-        # pooled_input = torch.mean(stacked_input, dim=3, keepdim=True)
-        pooled_input,_ = torch.max(stacked_input, dim=3, keepdim=True)
-
-        # reshape the tensor to the desired output shape [a, b, c]
-        output = pooled_input.squeeze(3)
-
-        return output
-
-class GatedGCN(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, gated_layers=2):
-        super(GatedGCN, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.gated_layers = gated_layers
-        self.conv1 = GCNConv(self.input_dim, self.hidden_dim)                                                           # GCNConv默认添加add_self_loops
-        # self.conv2 = GCNConv(self.input_dim, self.hidden_dim)
-        self.conv3 = GatedGraphConv(self.hidden_dim, self.gated_layers)
-
-    def forward(self, h_con, h_dep, h_seman):
-        # Build graph data structures
-        B, S, D = h_con.shape
-        h_con_ = h_con.view(-1)
-        h_dep_ = h_dep.view(-1)
-        h_seman_ = h_seman.view(-1)
-        features = torch.stack([h_con_, h_dep_, h_seman_], dim=-1)
-        data = Data(x=features)
-        data.cuda()
-        data.x = data.x.view(-1, self.input_dim)
-        data.edge_index, _ = dense_to_sparse(torch.ones(S, S).cuda())
-        data.edge_attr = compute_cosine_similarity(data.x, data.edge_index)
-        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-
-        x = F.relu(self.conv1(x, edge_index, edge_attr))
-        # x = F.relu(self.conv2(x, edge_index, edge_attr))
-        x = F.relu(self.conv3(x, edge_index))
-
-        h_fusion_con, h_fusion_dep, h_fusion_seman = x.view(3, B, S, D)[0], x.view(3, B, S, D)[1], x.view(3, B, S, D)[2]
-
-        return h_fusion_con, h_fusion_dep, h_fusion_seman
-    
-# Calculate the edge weights, i.e. Euclidean distance
-def edge_weight(x, edge_index):
-    row, col = edge_index
-    edge_attr = (x[row] - x[col]).norm(p=2, dim=-1).view(edge_index.size(1), -1)
-
-    return edge_attr
-
-# Cosine similarity
-def compute_cosine_similarity(x, edge_index):
-
-    edge_index_row, edge_index_col = edge_index[0], edge_index[1]
-
-    x_row = x[edge_index_row]
-    x_col = x[edge_index_col]
-    similarity = F.cosine_similarity(x_row, x_col, dim=1)
-    min_value = similarity.min()
-    max_value = similarity.max()
-    similarity = (similarity - min_value) / (max_value - min_value)
-
-    return similarity
-
-# Pearson correlation coefficient
-def compute_pearson_correlation(x, edge_index):
-    mean_x = torch.mean(x, dim=1)
-
-    # Compute differences between each value and the mean for x
-    diff_x = x - mean_x[:, None]
-
-    # Compute the sum of squared differences for x
-    sum_squared_diff_x = torch.sum(diff_x ** 2, dim=1)
-
-    # Compute the square root of the sum of squared differences for x
-    sqrt_sum_squared_diff_x = torch.sqrt(sum_squared_diff_x)
-
-    # Compute the product of the square roots for x
-    product_sqrt_diff_x = sqrt_sum_squared_diff_x[edge_index[0]] * sqrt_sum_squared_diff_x[edge_index[1]]
-
-    # Compute the sum of the multiplied differences
-    sum_multiplied_diff = torch.sum(diff_x[edge_index[0]] * diff_x[edge_index[1]], dim=1)
-
-    # Compute the Pearson correlation coefficient
-    pearson_corr = sum_multiplied_diff / product_sqrt_diff_x
-
-    return pearson_corr
-
-# Interact Module(EMFH)
-class ResEMFH(nn.Module):
-    def __init__(self, opt, d_bert):
-        super(ResEMFH, self).__init__()
-        self.opt = opt
-
-        if self.opt.high_order:
-            self.mfh1 = MFB(opt, False, d_bert)
-            self.mfh2 = MFB(opt, False, d_bert)
-            self.mfh3 = MFB(opt, False, d_bert)
-            self.mfh4 = MFB(opt, False, d_bert)
-            self.mfh5 = MFB(opt, False, d_bert)
-            self.mfh6 = MFB(opt, False, d_bert)
-        else:
-            self.mfb = MFB(opt, True, d_bert)
-
-    def forward(self, con_feat, dep_feat, sem_feat, amr_feat, know_feat):
-        if self.opt.high_order:
-            z1, exp1, f_pcon_1, f_pdep_1 = self.mfh1(con_feat, dep_feat, sem_feat, amr_feat, know_feat)
-            z2, exp2, f_pcon_2, f_pdep_2 = self.mfh2(f_pcon_1, f_pdep_1, sem_feat, amr_feat, know_feat, exp1)
-            z3, exp3, f_pcon_3, f_pdep_3 = self.mfh3(f_pcon_2, f_pdep_2, sem_feat, amr_feat, know_feat, exp2)
-            z4, exp4, f_pcon_4, f_pdep_4 = self.mfh4(f_pcon_3, f_pdep_3, sem_feat, amr_feat, know_feat, exp3)
-            z5, exp5, f_pcon_5, f_pdep_5 = self.mfh5(f_pcon_4, f_pdep_4, sem_feat, amr_feat, know_feat, exp4)
-            z6, exp6, f_pcon_6, f_pdep_6 = self.mfh6(f_pcon_5, f_pdep_5, sem_feat, amr_feat, know_feat, exp5)
-            z6 = z6 + z3  # residual
-            z = torch.mean(torch.cat((z1, z2, z3, z4, z5, z6), 1), dim=1, keepdim=False)
-        else:
-            z, _ = self.mfb(con_feat, dep_feat, sem_feat, amr_feat, know_feat)
-            z = z.squeeze(1)
-
-        return z
-    
-class MFB(nn.Module):
-    def __init__(self, opt, is_first, d_bert):
-        super(MFB, self).__init__()
-        self.opt = opt
-        self.is_first = is_first
-        self.bert_dim = d_bert
-
-        self.proj_i = nn.Linear(d_bert, d_bert)
-        self.proj_q = nn.Linear(d_bert, d_bert)
-        self.proj_ent = nn.Linear(d_bert, d_bert)
-        self.proj_amr = nn.Linear(d_bert, d_bert)
-        self.proj_struct = nn.Linear(2 * opt.lstm_dim + opt.dim_k, d_bert)
-
-        self.dropout = nn.Dropout(opt.dropout_r)
-
-    def forward(self, con_feat, dep_feat, sem_feat, amr_feat, know_feat, exp_in=1):
-        batch_size = con_feat.shape[0]
-
-        con_feat = self.proj_i(con_feat)
-        dep_feat = self.proj_q(dep_feat)
-        sem_feat = self.proj_ent(sem_feat)
-        amr_feat = self.proj_amr(amr_feat)
-        know_feat = self.proj_struct(know_feat)
-
-        # Cross-projection: AMR orthogonal to semantic
-        f_p_amr = amr_feat
-        f_c_sem = sem_feat
-        f_p_amr_ = proj(f_p_amr, f_c_sem)
-        f_pamr_tilde = proj(f_p_amr, (f_p_amr - f_p_amr_))
-
-        # Expanded stage (fused features)
-        exp_out = con_feat * dep_feat * sem_feat * f_pamr_tilde * know_feat
-        exp_out = self.dropout(exp_out) if self.is_first else self.dropout(exp_out * exp_in)
-
-        # Squeeze stage
-        z = torch.sqrt(F.relu(exp_out)) - torch.sqrt(F.relu(-exp_out))
-        z = F.normalize(z.view(batch_size, -1))
-        z = z.view(batch_size, -1, self.bert_dim)
-
-        # Orthogonal projections for con and dep
-        f_p_con = con_feat
-        f_p_con_ = proj(f_p_con, sem_feat)
-        f_pcon_tilde = proj(f_p_con, (f_p_con - f_p_con_))
-
-        f_p_dep = dep_feat
-        f_p_dep_ = proj(f_p_dep, sem_feat)
-        f_pdep_tilde = proj(f_p_dep, (f_p_dep - f_p_dep_))
-
-        return z, exp_out, f_pcon_tilde, f_pdep_tilde
-
-# def proj(x, y):
-#     # Project x onto y (x · y / y · y) * y
-#     y_norm_sq = (y * y).sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps
-#     proj_coeff = (x * y).sum(dim=-1, keepdim=True) / y_norm_sq
-#     return proj_coeff * y
-  
-def proj(x, y):
-    numerator = x * y
-    denominator = torch.abs(y) + torch.finfo(torch.float32).eps  
-    projection = numerator / denominator * (y / denominator)
-    
-    return projection
-
-class FC(nn.Module):
-    def __init__(self, in_size, out_size, dropout_r=0., use_relu=True):
-        super(FC, self).__init__()
-        self.dropout_r = dropout_r
-        self.use_relu = use_relu
-
-        self.linear = nn.Linear(in_size, out_size)
-
-        if use_relu:
-            self.relu = nn.ReLU(inplace=True)
-
-        if dropout_r > 0:
-            self.dropout = nn.Dropout(dropout_r)
-
-    def forward(self, x):
-        x = self.linear(x)
-
-        if self.use_relu:
-            x = self.relu(x)
-
-        if self.dropout_r > 0:
-            x = self.dropout(x)
-
-        return x
-
-class MLP(nn.Module):
-    def __init__(self, in_size, mid_size, out_size, dropout_r=0., use_relu=True):
-        super(MLP, self).__init__()
-
-        self.fc = FC(in_size, mid_size, dropout_r=dropout_r, use_relu=use_relu)
-        self.linear = nn.Linear(mid_size, out_size)
-
-    def forward(self, x):
-        return self.linear(self.fc(x))
     
 class HFfusion(nn.Module):
     def __init__(self, opt, d_bert):
@@ -874,6 +678,37 @@ class HFfusion(nn.Module):
         if len(graph_know.shape) == 2 and graph_know.size(-1) != self.d_bert:
             graph_know = self.knowledge_proj(graph_know)
         
+        # Check if ablation study is requested based on fusion_condition
+        if hasattr(self.opt, 'fusion_condition') and self.opt.fusion_condition != 'HF':
+            # Ablation study with 7 specific combinations
+            if self.opt.fusion_condition == "CD":
+                # CD → Constituency + Dependency
+                final_outputs = torch.cat((graph_con, graph_dep), dim=-1)
+            elif self.opt.fusion_condition == "A":
+                # A → AMR
+                final_outputs = graph_amr
+            elif self.opt.fusion_condition == "K":
+                # K → Knowledge Graph
+                final_outputs = graph_know
+            elif self.opt.fusion_condition == "CD+A":
+                # CD + A → Constituency + Dependency + AMR
+                final_outputs = torch.cat((graph_con, graph_dep, graph_amr), dim=-1)
+            elif self.opt.fusion_condition == "CD+K":
+                # CD + K → Constituency + Dependency + Knowledge Graph
+                final_outputs = torch.cat((graph_con, graph_dep, graph_know), dim=-1)
+            elif self.opt.fusion_condition == "A+K":
+                # A + K → AMR + Knowledge Graph
+                final_outputs = torch.cat((graph_amr, graph_know), dim=-1)
+            elif self.opt.fusion_condition == "CD+A+K":
+                # CD + A + K → Constituency + Dependency + AMR + Knowledge Graph
+                final_outputs = torch.cat((graph_con, graph_dep, graph_amr, graph_know), dim=-1)
+            else:
+                # Default to AMR if unknown fusion condition
+                final_outputs = graph_amr
+            
+            return final_outputs
+        
+        # Original HF (Hierarchical Fusion) logic below
         # Reshape inputs for attention (add sequence dimension if needed)
         if len(bert_enc.shape) == 2:
             bert_enc = bert_enc.unsqueeze(1)  # [B, 1, D]

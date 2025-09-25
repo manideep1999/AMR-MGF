@@ -13,8 +13,9 @@
 #                     --max_num_spans 6 --dep_layers 6 --sem_layers 9 --amr_layers 9 --fusion_condition HF --gamma 1 --theta 0.5
 
 # * restaurants (with amrbart)
- python ./train.py --model_name EHFB --dataset restaurant_amrbart --seed 42 --bert_lr 5e-5 --batch_size 32 --num_epoch 20 --bert_dim 768 --max_length 100 \
-                    --max_num_spans 6 --dep_layers 6 --sem_layers 9 --amr_layers 9 --fusion_condition HF --gamma 1 --theta 0.5 
+python ./train.py --model_name EHFB --dataset restaurant_amrbart --seed 42 --bert_lr 2e-5 --batch_size 32 --num_epoch 20 --bert_dim 768 --max_length 100 \
+                   --max_num_spans 3 --dep_layers 9 --sem_layers 9 --amr_layers 9 --fusion_condition CD+A+K --gamma 1 --theta 0.12 --dim_k 200 \
+                       --lambda_dep 1.0 --lambda_amr 0.5 --lambda_kg_scalar 1.0
 
 # * twitter (with spring)
 # python ./train.py --model_name EHFB --dataset twitter_spring --seed 100 --bert_lr 2e-5 --batch_size 16 --num_epoch 20 --bert_dim 768 --max_length 100 \
